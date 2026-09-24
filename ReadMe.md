@@ -1,6 +1,6 @@
 👻 GHOST OS v2.0 - The Next-Gen Portable Diagnostic Suite 👻
 Developed by: @pinoyunknown
-Source Repository: ://github.com
+Source Repository: ://[github.com](https://github.com/PinoyUnknown/ghost-firmware)
 
 Break away from standard, static interfaces. Ghost OS transforms your M5Stack hardware into a high-performance, responsive diagnostic asset built entirely from the ground up using a multi-threaded architecture.
 
