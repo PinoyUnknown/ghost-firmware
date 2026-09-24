@@ -1,0 +1,28 @@
+{
+  "app_name": "Ghost OS",
+  "version": "2.0.0",
+  "author": "PinoyUnknown",
+  "description": "An advanced, highly responsive multi-device tactical diagnostic utility running a dual-core RTOS engine with animated cyberpunk themes.",
+  "category": "Tools",
+  "repository": "https://github.com",
+  "website": "https://instagram.com",
+  "supported_boards": [
+    "m5stack-cardputer",
+    "m5stack-core2",
+    "m5stick-cplus"
+  ],
+  "binaries": {
+    "m5stack-cardputer": "GhostFirmware_Cardputer.bin",
+    "m5stack-core2": "GhostFirmware_Core2.bin",
+    "m5stick-cplus": "GhostFirmware_StickCPlus.bin"
+  },
+  "keywords": [
+    "ghost",
+    "diagnostic",
+    "wireless",
+    "cyberpunk",
+    "matrix",
+    "bruce",
+    "cardputer"
+  ]
+}
