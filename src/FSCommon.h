@@ -1,0 +1,69 @@
+#pragma once
+
+#include "configuration.h"
+#include <vector>
+
+// Cross platform filesystem API
+
+#if defined(ARCH_PORTDUINO)
+// Portduino version
+#include "PortduinoFS.h"
+#define FSCom PortduinoFS
+#define FSBegin() true
+#define FILE_O_WRITE "w"
+#define FILE_O_READ "r"
+#endif
+
+#if defined(ARCH_STM32)
+// STM32
+#include "LittleFS.h"
+#define FSCom InternalFS
+#define FSBegin() FSCom.begin()
+using namespace STM32_LittleFS_Namespace;
+#endif
+
+#if defined(ARCH_RP2040)
+// RP2040
+#include "LittleFS.h"
+#define FSCom LittleFS
+#define FSBegin() FSCom.begin() // set autoformat
+#define FILE_O_WRITE "w"
+#define FILE_O_READ "r"
+#endif
+
+#if defined(ARCH_ESP32)
+// ESP32 version
+#include "LittleFS.h"
+#define FSCom LittleFS
+#define FSBegin() FSCom.begin(true) // format on failure
+#define FILE_O_WRITE "w"
+#define FILE_O_READ "r"
+#endif
+
+#if defined(ARCH_NRF52)
+// NRF52 version
+#include "InternalFileSystem.h"
+#define FSCom InternalFS
+#define FSBegin() FSCom.begin() // InternalFS formats on failure
+using namespace Adafruit_LittleFS_Namespace;
+#endif
+
+// Filesystem capacity, in bytes. Only ESP32's LittleFS and the nRF54L15 wrapper expose totalBytes()/usedBytes()
+// directly; the other backends need per-platform work (littlefs v1 traversal, FSInfo, statvfs), so callers must
+// use these helpers rather than reaching into FSCom.
+size_t fsTotalBytes();
+size_t fsUsedBytes();
+
+void fsInit();
+bool renameFile(const char *pathFrom, const char *pathTo);
+bool fsFormat();
+std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount = 64, bool *wasLimited = nullptr);
+void listDir(const char *dirname, uint8_t levels, bool del = false);
+void rmDir(const char *dirname);
+void setupSDCard();
+
+#if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI) && defined(SDCARD_USE_SPI1)
+#include <SPI.h>
+// HSPI bus set up by setupSDCard(). Reuse this for other devices on the same bus.
+extern SPIClass SPI_HSPI;
+#endif

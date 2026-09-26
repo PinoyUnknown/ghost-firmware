@@ -1,0 +1,4 @@
+# Emscripten/WebUSB browser glue for the wasm node — not part of the firmware
+# binary or its security surface. The format-string rule false-positives on its
+# benign retry/diagnostic console logs.
+src/platform/portduino/wasm/js/

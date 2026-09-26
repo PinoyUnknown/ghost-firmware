@@ -1,0 +1,1658 @@
+#include "DebugConfiguration.h"
+#include "TestUtil.h"
+#include <unity.h>
+
+#ifdef ARCH_PORTDUINO
+#include "mesh/CryptoEngine.h"
+#include "mesh/Default.h"
+#include "mesh/MeshService.h"
+#include "mesh/NodeDB.h"
+#include "mesh/Router.h"
+#include "modules/RoutingModule.h"
+#include "mqtt/MQTT.h"
+#include "mqtt/ServiceEnvelope.h"
+
+#include "support/DeterministicRng.h" // rngSeed/rngNext/rngByte/rngRange - shared seeded LCG (fuzz group)
+
+#include <PubSubClient.h>
+#include <WiFiClient.h>
+
+// htonl() for remoteIP() below. MinGW has no <arpa/inet.h>; the byte-order helpers live in
+// winsock2.h, which must precede any <windows.h> the Arduino shims pull in.
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
+
+#include <algorithm>
+#include <list>
+#include <map>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+
+namespace
+{
+// Minimal router needed to receive messages from MQTT.
+class MockRouter : public Router
+{
+  public:
+    ~MockRouter()
+    {
+        // cryptLock is created in the constructor for Router.
+        delete cryptLock;
+        cryptLock = NULL;
+    }
+    void enqueueReceivedMessage(meshtastic_MeshPacket *p) override
+    {
+        packets_.emplace_back(*p);
+        packetPool.release(p);
+    }
+    std::list<meshtastic_MeshPacket> packets_; // Packets received by the Router.
+};
+
+// Minimal MeshService needed to receive messages from MQTT for testing PKI channel.
+class MockMeshService : public MeshService
+{
+  public:
+    // No PhoneAPI reader exists in these tests, so packets the receive pipeline forwards to the phone
+    // (MeshService::sendToPhone enqueues pooled copies into toPhoneQueue) would leak at teardown. Drain
+    // the queue like the phone would. This surfaced once sendLocal() began dispatching local packets
+    // through handleReceived() directly rather than via the (mock-overridden) enqueueReceivedMessage().
+    ~MockMeshService()
+    {
+        while (meshtastic_MeshPacket *p = getForPhone())
+            releaseToPool(p);
+    }
+    void sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m) override
+    {
+        messages_.emplace_back(*m);
+        releaseMqttClientProxyMessageToPool(m);
+    }
+    void sendClientNotification(meshtastic_ClientNotification *n) override
+    {
+        notifications_.emplace_back(*n);
+        releaseClientNotificationToPool(n);
+    }
+    std::list<meshtastic_MqttClientProxyMessage> messages_;  // Messages received from the MeshService.
+    std::list<meshtastic_ClientNotification> notifications_; // Notifications received from the MeshService.
+};
+
+// Minimal NodeDB needed to return values from getMeshNode.
+class MockNodeDB : public NodeDB
+{
+  public:
+    // Per-NodeNum overlay on top of the shared node, so a test can make one endpoint known
+    // while another stays unknown; everything else keeps the shared-node semantics.
+    meshtastic_NodeInfoLite *getMeshNode(NodeNum n) override
+    {
+        auto it = nodes_.find(n);
+        return it != nodes_.end() ? &it->second : &emptyNode;
+    }
+    meshtastic_NodeInfoLite emptyNode = {};
+    std::map<NodeNum, meshtastic_NodeInfoLite> nodes_;
+};
+
+// Minimal RoutingModule needed to return values from sendAckNak.
+class MockRoutingModule : public RoutingModule
+{
+  public:
+    void sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit = 0,
+                    bool ackWantsAck = false, const meshtastic_MeshPacket *relaySource = nullptr) override
+    {
+        (void)ackWantsAck;
+        (void)relaySource;
+        ackNacks_.emplace_back(err, to, idFrom, chIndex, hopLimit);
+    }
+    std::list<std::tuple<meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t>>
+        ackNacks_; // ackNacks received by the RoutingModule.
+};
+
+// A WiFi client used by the MQTT::PubSubClient. Implements a minimal pub/sub server.
+// There isn't an easy way to mock PubSubClient due to it not having virtual methods, so we mock using
+// the WiFiClinet that PubSubClient uses.
+class MockPubSubServer : public WiFiClient
+{
+  public:
+    static constexpr char kTextTopic[] = "TextTopic";
+    uint8_t connected() override { return connected_; }
+    void flush() override {}
+    IPAddress remoteIP() const override { return IPAddress(htonl(ipAddress_)); }
+    void stop() override { connected_ = false; }
+
+    int connect(IPAddress ip, uint16_t port) override
+    {
+        port_ = port;
+        if (refuseConnection_)
+            return 0;
+        connected_ = true;
+        return 1;
+    }
+    int connect(const char *host, uint16_t port) override
+    {
+        host_ = host;
+        port_ = port;
+        if (refuseConnection_)
+            return 0;
+        connected_ = true;
+        return 1;
+    }
+
+    int available() override
+    {
+        if (buffer_.empty())
+            return 0;
+        return buffer_.front().size();
+    }
+
+    int read() override
+    {
+        assert(available());
+        std::string &front = buffer_.front();
+        char ch = front[0];
+        front = front.substr(1, front.size());
+        if (front.empty())
+            buffer_.pop_front();
+        return ch;
+    }
+
+    size_t write(uint8_t data) override { return write(&data, 1); }
+    size_t write(const uint8_t *buf, size_t size) override
+    {
+        command_ += std::string(reinterpret_cast<const char *>(buf), size);
+        if (command_.size() < 2)
+            return size;
+        const int len = (uint8_t)command_[1] + 2;
+        if (command_.size() < len)
+            return size;
+        handleCommand(command_[0], command_.substr(2, len));
+        command_ = command_.substr(len, command_.size());
+        return size;
+    }
+
+    // The pub/sub "server".
+    // https://public.dhe.ibm.com/software/dw/webservices/ws-mqtt/MQTT_V3.1_Protocol_Specific.pdf
+    void handleCommand(uint8_t header, std::string_view message)
+    {
+        switch (header & 0xf0) {
+        case MQTTCONNECT:
+            LOG_DEBUG("MQTTCONNECT");
+            buffer_.push_back(std::string("\x20\x02\x00\x00", 4));
+            break;
+
+        case MQTTSUBSCRIBE: {
+            LOG_DEBUG("MQTTSUBSCRIBE");
+            assert(message.size() >= 5);
+            message.remove_prefix(2); // skip messageId
+
+            while (message.size() >= 3) {
+                const uint16_t topicSize = ((uint8_t)message[0]) << 8 | (uint8_t)message[1];
+                message.remove_prefix(2);
+
+                assert(message.size() >= topicSize + 1);
+                std::string topic(message.data(), topicSize);
+                message.remove_prefix(topicSize + 1);
+
+                LOG_DEBUG("Subscribed to topic: %s", topic.c_str());
+                subscriptions_.insert(std::move(topic));
+            }
+            break;
+        }
+
+        case MQTTPINGREQ:
+            LOG_DEBUG("MQTTPINGREQ");
+            buffer_.push_back(std::string("\xd0\x00", 2));
+            break;
+
+        case MQTTPUBLISH: {
+            LOG_DEBUG("MQTTPUBLISH");
+            assert(message.size() >= 3);
+            const uint16_t topicSize = ((uint8_t)message[0]) << 8 | (uint8_t)message[1];
+            message.remove_prefix(2);
+
+            assert(message.size() >= topicSize);
+            std::string topic(message.data(), topicSize);
+            message.remove_prefix(topicSize);
+
+            if (topic == kTextTopic) {
+                published_.emplace_back(std::move(topic), std::string(message.data(), message.size()));
+            } else {
+                published_.emplace_back(
+                    std::move(topic), DecodedServiceEnvelope(reinterpret_cast<const uint8_t *>(message.data()), message.size()));
+            }
+            break;
+        }
+        }
+    }
+
+    bool connected_ = false;
+    bool refuseConnection_ = false;       // Simulate a failed connection.
+    uint32_t ipAddress_ = 0x01010101;     // IP address of the MQTT server.
+    std::string host_;                    // Requested host.
+    uint16_t port_;                       // Requested port.
+    std::list<std::string> buffer_;       // Buffer of messages for the pubSub client to receive.
+    std::string command_;                 // Current command received from the pubSub client.
+    std::set<std::string> subscriptions_; // Topics that the pubSub client has subscribed to.
+    std::list<std::pair<std::string, std::variant<std::string,
+                                                  DecodedServiceEnvelope>>>
+        published_; // Messages published from the pubSub client. Each list element is a pair containing the topic name and either
+                    // a text message (if from the kTextTopic topic) or a DecodedServiceEnvelope.
+};
+
+// Instances of our mocks.
+class MQTTUnitTest;
+MQTTUnitTest *unitTest;
+MockPubSubServer *pubsub;
+MockRoutingModule *mockRoutingModule;
+MockMeshService *mockMeshService;
+MockRouter *mockRouter;
+MockNodeDB *mockNodeDB;
+
+// Keep running the loop until either conditionMet returns true or 4 seconds elapse.
+// Returns true if conditionMet returns true, returns false on timeout.
+bool loopUntil(std::function<bool()> conditionMet)
+{
+    long start = millis();
+    while (start + 4000 > millis()) {
+        long delayMsec = concurrency::mainController.runOrDelay();
+        if (conditionMet())
+            return true;
+        concurrency::mainDelay.delay(std::min(delayMsec, 5L));
+    }
+    return false;
+}
+
+// Used to access protected/private members of MQTT for unit testing.
+class MQTTUnitTest : public MQTT
+{
+  public:
+    MQTTUnitTest() : MQTT(std::make_unique<MockPubSubServer>())
+    {
+        pubsub = reinterpret_cast<MockPubSubServer *>(mqttClient.get());
+    }
+    ~MQTTUnitTest()
+    {
+        // Needed because WiFiClient does not have a virtual destructor.
+        mqttClient.release();
+        delete pubsub;
+    }
+    using MQTT::isValidConfig;
+    using MQTT::reconnect;
+    int queueSize() { return mqttQueue.numUsed(); }
+    void reportToMap(std::optional<uint32_t> precision = std::nullopt)
+    {
+        if (precision.has_value())
+            map_position_precision = precision.value();
+        map_publish_interval_msecs = 0;
+        perhapsReportToMap();
+    }
+    void publish(const meshtastic_MeshPacket *p, std::string gateway = "!87654321", std::string channel = "test")
+    {
+        std::stringstream topic;
+        topic << "msh/2/e/" << channel << "/!" << gateway;
+        const meshtastic_ServiceEnvelope env = {.packet = const_cast<meshtastic_MeshPacket *>(p),
+                                                .channel_id = const_cast<char *>(channel.c_str()),
+                                                .gateway_id = const_cast<char *>(gateway.c_str())};
+        uint8_t bytes[256];
+        size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
+        mqttCallback(const_cast<char *>(topic.str().c_str()), bytes, numBytes);
+    }
+    // Feed arbitrary bytes straight into the subscription callback - the non-RF ingress a malicious or
+    // broken broker could push. Mirrors publish()'s final mqttCallback() call but with an unconstrained
+    // payload, so it exercises DecodedServiceEnvelope decode + onReceiveProto with garbage.
+    void deliverRaw(const std::string &topic, const uint8_t *bytes, size_t n)
+    {
+        mqttCallback(const_cast<char *>(topic.c_str()), const_cast<uint8_t *>(bytes), (unsigned int)n);
+    }
+    static void restart()
+    {
+        if (mqtt != NULL) {
+            delete mqtt;
+            mqtt = unitTest = NULL;
+        }
+        mqtt = unitTest = new MQTTUnitTest();
+        mqtt->start();
+
+        auto clearStartupOutput = []() {
+            pubsub->published_.clear();
+            if (mockMeshService != nullptr) {
+                mockMeshService->messages_.clear();
+                mockMeshService->notifications_.clear();
+            }
+        };
+
+        if (!moduleConfig.mqtt.enabled || moduleConfig.mqtt.proxy_to_client_enabled || *moduleConfig.mqtt.root) {
+            loopUntil([] { return true; }); // Loop once
+            clearStartupOutput();
+            return;
+        }
+        // Wait for MQTT to subscribe to all topics.
+        TEST_ASSERT_TRUE(loopUntil(
+            [] { return pubsub->subscriptions_.count("msh/2/e/test/+") && pubsub->subscriptions_.count("msh/2/e/PKI/+"); }));
+        clearStartupOutput();
+    }
+    PubSubClient &getPubSub() { return pubSub; }
+};
+
+// Packets used in unit tests.
+const meshtastic_MeshPacket decoded = {
+    .from = 1,
+    .to = 2,
+    .which_payload_variant = meshtastic_MeshPacket_decoded_tag,
+    .decoded = {.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP, .has_bitfield = true, .bitfield = BITFIELD_OK_TO_MQTT_MASK},
+    .id = 4,
+};
+const meshtastic_MeshPacket encrypted = {
+    .from = 1,
+    .to = 2,
+    .which_payload_variant = meshtastic_MeshPacket_encrypted_tag,
+    .encrypted = {.size = 0},
+    .id = 3,
+};
+
+void configureCoordinatePolicyChannels(bool eventChannelIsPrimary = true)
+{
+    memset(&channelFile, 0, sizeof(channelFile));
+    channelFile.channels_count = 2;
+
+    auto &eventChannel = channelFile.channels[0];
+    eventChannel.index = 0;
+    eventChannel.has_settings = true;
+    strncpy(eventChannel.settings.name, "everyone", sizeof(eventChannel.settings.name) - 1);
+    eventChannel.settings.uplink_enabled = true;
+    eventChannel.settings.downlink_enabled = true;
+    eventChannel.role = eventChannelIsPrimary ? meshtastic_Channel_Role_PRIMARY : meshtastic_Channel_Role_SECONDARY;
+#ifdef USERPREFS_CHANNEL_0_PSK
+    static const uint8_t configuredEventPsk[] = USERPREFS_CHANNEL_0_PSK;
+    eventChannel.settings.psk.size = sizeof(configuredEventPsk);
+    memcpy(eventChannel.settings.psk.bytes, configuredEventPsk, sizeof(configuredEventPsk));
+#endif
+
+    auto &privateChannel = channelFile.channels[1];
+    privateChannel.index = 1;
+    privateChannel.has_settings = true;
+    strncpy(privateChannel.settings.name, "private", sizeof(privateChannel.settings.name) - 1);
+    privateChannel.settings.psk.size = 32;
+    memset(privateChannel.settings.psk.bytes, 0xab, privateChannel.settings.psk.size);
+    privateChannel.settings.uplink_enabled = true;
+    privateChannel.settings.downlink_enabled = true;
+    privateChannel.role = eventChannelIsPrimary ? meshtastic_Channel_Role_SECONDARY : meshtastic_Channel_Role_PRIMARY;
+
+    channels.onConfigChanged();
+}
+
+meshtastic_MeshPacket makePositionPacket(ChannelIndex channel)
+{
+    meshtastic_MeshPacket packet = decoded;
+    packet.to = NODENUM_BROADCAST;
+    packet.channel = channel;
+    packet.decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    return packet;
+}
+
+void clearPublicationState()
+{
+    TEST_ASSERT_EQUAL(0, unitTest->queueSize());
+    pubsub->published_.clear();
+    mockMeshService->messages_.clear();
+}
+} // namespace
+
+// Initialize mocks and configuration before running each test.
+void setUp(void)
+{
+    memset(&config, 0, sizeof(config));
+    moduleConfig.mqtt =
+        meshtastic_ModuleConfig_MQTTConfig{.enabled = true, .map_reporting_enabled = true, .has_map_report_settings = true};
+    moduleConfig.mqtt.map_report_settings = meshtastic_ModuleConfig_MapReportSettings{
+        .publish_interval_secs = 0, .position_precision = 14, .should_report_location = true};
+    memset(&channelFile, 0, sizeof(channelFile));
+    channelFile.channels[0] = meshtastic_Channel{
+        .index = 0,
+        .has_settings = true,
+        .settings = {.name = "test", .uplink_enabled = true, .downlink_enabled = true},
+        .role = meshtastic_Channel_Role_PRIMARY,
+    };
+    channelFile.channels_count = 1;
+    channels.onConfigChanged();
+    owner = meshtastic_User{.id = "!12345678"};
+    myNodeInfo = meshtastic_MyNodeInfo{.my_node_num = 0x12345678}; // Match the expected gateway ID in topic
+    localPosition =
+        meshtastic_Position{.has_latitude_i = true, .latitude_i = 700000000, .has_longitude_i = true, .longitude_i = 300000000};
+
+    // The shared MockNodeDB node is mutated by the XEdDSA policy tests (signer bit, public
+    // key); reset it so state can't leak between tests.
+    if (mockNodeDB) {
+        mockNodeDB->emptyNode = meshtastic_NodeInfoLite();
+        mockNodeDB->nodes_.clear();
+    }
+
+    router = mockRouter = new MockRouter();
+    service = mockMeshService = new MockMeshService();
+    routingModule = mockRoutingModule = new MockRoutingModule();
+    MQTTUnitTest::restart();
+}
+
+// Deinitialize all objects created in setUp.
+void tearDown(void)
+{
+    delete unitTest;
+    mqtt = unitTest = NULL;
+    delete mockRoutingModule;
+    routingModule = mockRoutingModule = NULL;
+    delete mockMeshService;
+    service = mockMeshService = NULL;
+    delete mockRouter;
+    router = mockRouter = NULL;
+}
+
+// Test that the decoded MeshPacket is published when encryption_enabled = false.
+void test_sendDirectlyConnectedDecoded(void)
+{
+    mqtt->onSend(encrypted, decoded, 0);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    const DecodedServiceEnvelope &env = std::get<DecodedServiceEnvelope>(payload);
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", topic.c_str());
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(decoded.id, env.packet->id);
+}
+
+// Test that the encrypted MeshPacket is published when encryption_enabled = true.
+void test_sendDirectlyConnectedEncrypted(void)
+{
+    moduleConfig.mqtt.encryption_enabled = true;
+
+    mqtt->onSend(encrypted, decoded, 0);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    const DecodedServiceEnvelope &env = std::get<DecodedServiceEnvelope>(payload);
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", topic.c_str());
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(encrypted.id, env.packet->id);
+}
+
+void test_eventPositionPublicationFollowsCompileTimePolicy(void)
+{
+    configureCoordinatePolicyChannels();
+    clearPublicationState();
+    const meshtastic_MeshPacket position = makePositionPacket(0);
+
+    mqtt->onSend(encrypted, position, 0);
+
+#if USERPREFS_BLOCK_POSITION_ON_EVENT_CHANNEL && defined(USERPREFS_CHANNEL_0_PSK)
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+    TEST_ASSERT_EQUAL(0, unitTest->queueSize());
+#else
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+#endif
+}
+
+void test_privatePositionStillPublishesWithEventPolicy(void)
+{
+    configureCoordinatePolicyChannels();
+    clearPublicationState();
+    const meshtastic_MeshPacket position = makePositionPacket(1);
+
+    mqtt->onSend(encrypted, position, 1);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/private/!12345678", pubsub->published_.front().first.c_str());
+}
+
+void test_explicitPkiPositionStillPublishesWithEventPolicy(void)
+{
+    configureCoordinatePolicyChannels();
+    clearPublicationState();
+    meshtastic_MeshPacket position = makePositionPacket(0);
+    meshtastic_MeshPacket encryptedPki = encrypted;
+    position.to = 2;
+    position.pki_encrypted = true;
+    encryptedPki.pki_encrypted = true;
+
+    mqtt->onSend(encryptedPki, position, 0);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/PKI/!12345678", pubsub->published_.front().first.c_str());
+}
+
+// Verify that the decoded MeshPacket is proxied through the MeshService when encryption_enabled = false.
+void test_proxyToMeshServiceDecoded(void)
+{
+    moduleConfig.mqtt.proxy_to_client_enabled = true;
+    MQTTUnitTest::restart();
+
+    mqtt->onSend(encrypted, decoded, 0);
+
+    TEST_ASSERT_EQUAL(1, mockMeshService->messages_.size());
+    const meshtastic_MqttClientProxyMessage &message = mockMeshService->messages_.front();
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", message.topic);
+    TEST_ASSERT_EQUAL(meshtastic_MqttClientProxyMessage_data_tag, message.which_payload_variant);
+    const DecodedServiceEnvelope env(message.payload_variant.data.bytes, message.payload_variant.data.size);
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(decoded.id, env.packet->id);
+}
+
+// Verify that the encrypted MeshPacket is proxied through the MeshService when encryption_enabled = true.
+void test_proxyToMeshServiceEncrypted(void)
+{
+    moduleConfig.mqtt.proxy_to_client_enabled = true;
+    moduleConfig.mqtt.encryption_enabled = true;
+    MQTTUnitTest::restart();
+
+    mqtt->onSend(encrypted, decoded, 0);
+
+    TEST_ASSERT_EQUAL(1, mockMeshService->messages_.size());
+    const meshtastic_MqttClientProxyMessage &message = mockMeshService->messages_.front();
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", message.topic);
+    TEST_ASSERT_EQUAL(meshtastic_MqttClientProxyMessage_data_tag, message.which_payload_variant);
+    const DecodedServiceEnvelope env(message.payload_variant.data.bytes, message.payload_variant.data.size);
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(encrypted.id, env.packet->id);
+}
+
+// A packet without the OK to MQTT bit set should not be published to a public server.
+void test_dontMqttMeOnPublicServer(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.decoded.bitfield = 0;
+    p.decoded.has_bitfield = 0;
+
+    mqtt->onSend(encrypted, p, 0);
+
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+}
+
+// A packet without the OK to MQTT bit set should be published to a private server.
+void test_okToMqttOnPrivateServer(void)
+{
+    // Cause a disconnect.
+    pubsub->connected_ = false;
+    pubsub->refuseConnection_ = true;
+    TEST_ASSERT_TRUE(loopUntil([] { return !unitTest->getPubSub().connected(); }));
+
+    // Use 127.0.0.1 for the server's IP.
+    pubsub->ipAddress_ = 0x7f000001;
+
+    // Reconnect.
+    pubsub->refuseConnection_ = false;
+    TEST_ASSERT_TRUE(loopUntil([] { return unitTest->getPubSub().connected(); }));
+
+    // Send the same packet as test_dontMqttMeOnPublicServer.
+    meshtastic_MeshPacket p = decoded;
+    p.decoded.bitfield = 0;
+    p.decoded.has_bitfield = 0;
+
+    mqtt->onSend(encrypted, p, 0);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+}
+
+// Range tests messages are not uplinked to the default server.
+void test_noRangeTestAppOnDefaultServer(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.decoded.portnum = meshtastic_PortNum_RANGE_TEST_APP;
+
+    mqtt->onSend(encrypted, p, 0);
+
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+}
+
+// Detection sensor messages are not uplinked to the default server.
+void test_noDetectionSensorAppOnDefaultServer(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.decoded.portnum = meshtastic_PortNum_DETECTION_SENSOR_APP;
+
+    mqtt->onSend(encrypted, p, 0);
+
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+}
+
+// Test that a MeshPacket is queued while the MQTT server is disconnected.
+void test_sendQueued(void)
+{
+    // Cause a disconnect.
+    pubsub->connected_ = false;
+    pubsub->refuseConnection_ = true;
+    TEST_ASSERT_TRUE(loopUntil([] { return !unitTest->getPubSub().connected(); }));
+
+    // Send while disconnected.
+    mqtt->onSend(encrypted, decoded, 0);
+    TEST_ASSERT_EQUAL(1, unitTest->queueSize());
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+    TEST_ASSERT_FALSE(unitTest->getPubSub().connected());
+
+    // Allow reconnect to happen. Expect to see the packet published now.
+    pubsub->refuseConnection_ = false;
+    TEST_ASSERT_TRUE(loopUntil([] { return !pubsub->published_.empty(); }));
+
+    TEST_ASSERT_EQUAL(0, unitTest->queueSize());
+    const auto &[topic, payload] = pubsub->published_.front();
+    const DecodedServiceEnvelope &env = std::get<DecodedServiceEnvelope>(payload);
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", topic.c_str());
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(decoded.id, env.packet->id);
+}
+
+// Verify reconnecting with the proxy enabled does not reconnect to a MQTT server.
+void test_reconnectProxyDoesNotReconnectMqtt(void)
+{
+    moduleConfig.mqtt.proxy_to_client_enabled = true;
+    MQTTUnitTest::restart();
+
+    unitTest->reconnect();
+
+    TEST_ASSERT_FALSE(pubsub->connected_);
+}
+
+// Test receiving an empty MeshPacket on a subscribed topic.
+void test_receiveEmptyMeshPacket(void)
+{
+    unitTest->publish(NULL);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+    TEST_ASSERT_TRUE(mockRoutingModule->ackNacks_.empty());
+}
+
+// Test receiving a decoded MeshPacket on a subscribed topic.
+void test_receiveDecodedProto(void)
+{
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &p = mockRouter->packets_.front();
+    TEST_ASSERT_EQUAL(decoded.id, p.id);
+    TEST_ASSERT_TRUE(p.via_mqtt);
+}
+
+// Test receiving a decoded MeshPacket from the phone proxy.
+void test_receiveDecodedProtoFromProxy(void)
+{
+    const meshtastic_ServiceEnvelope env = {
+        .packet = const_cast<meshtastic_MeshPacket *>(&decoded), .channel_id = "test", .gateway_id = "!87654321"};
+    meshtastic_MqttClientProxyMessage message = meshtastic_MqttClientProxyMessage_init_default;
+    strcat(message.topic, "msh/2/e/test/!87654321");
+    message.which_payload_variant = meshtastic_MqttClientProxyMessage_data_tag;
+    message.payload_variant.data.size = pb_encode_to_bytes(
+        message.payload_variant.data.bytes, sizeof(message.payload_variant.data.bytes), &meshtastic_ServiceEnvelope_msg, &env);
+
+    mqtt->onClientProxyReceive(message);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &p = mockRouter->packets_.front();
+    TEST_ASSERT_EQUAL(decoded.id, p.id);
+    TEST_ASSERT_TRUE(p.via_mqtt);
+}
+
+// Properly handles the case where the received message is empty.
+void test_receiveEmptyDataFromProxy(void)
+{
+    meshtastic_MqttClientProxyMessage message = meshtastic_MqttClientProxyMessage_init_default;
+    message.which_payload_variant = meshtastic_MqttClientProxyMessage_data_tag;
+
+    mqtt->onClientProxyReceive(message);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Text must be read as text: data.size aliases the string's first bytes, so reading it regardless
+// of the variant let a client name a length of up to PB_SIZE_MAX. There is no delivery control for
+// this variant: an encoded ServiceEnvelope always contains NUL, so text can never carry one.
+void test_receiveTextVariantFromProxyIsNotReadAsBytes(void)
+{
+    meshtastic_MqttClientProxyMessage message = meshtastic_MqttClientProxyMessage_init_default;
+    snprintf(message.topic, sizeof(message.topic), "msh/2/e/test/!87654321");
+    message.which_payload_variant = meshtastic_MqttClientProxyMessage_text_tag;
+    // data.size would read these as the largest length a pb_size_t can name.
+    memset(message.payload_variant.text, 0xFF, sizeof(message.payload_variant.text) - 1);
+    message.payload_variant.text[sizeof(message.payload_variant.text) - 1] = '\0';
+
+    mqtt->onClientProxyReceive(message);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A proxy message with no payload variant set must be ignored rather than read as bytes.
+void test_receiveNoVariantFromProxyIsIgnored(void)
+{
+    meshtastic_MqttClientProxyMessage message = meshtastic_MqttClientProxyMessage_init_default;
+    snprintf(message.topic, sizeof(message.topic), "msh/2/e/test/!87654321");
+    message.which_payload_variant = 0;
+    memset(message.payload_variant.data.bytes, 0xFF, sizeof(message.payload_variant.data.bytes));
+    message.payload_variant.data.size = sizeof(message.payload_variant.data.bytes);
+
+    mqtt->onClientProxyReceive(message);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Packets should be ignored if downlink is not enabled.
+void test_receiveWithoutChannelDownlink(void)
+{
+    channelFile.channels[0].settings.downlink_enabled = false;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Test receiving an encrypted MeshPacket on the PKI topic.
+void test_receiveEncryptedPKITopicToUs(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT;
+    meshtastic_MeshPacket e = encrypted;
+    e.to = myNodeInfo.my_node_num;
+
+    unitTest->publish(&e, "!87654321", "PKI");
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &p = mockRouter->packets_.front();
+    TEST_ASSERT_EQUAL(encrypted.id, p.id);
+    TEST_ASSERT_TRUE(p.via_mqtt);
+}
+
+// Should ignore messages published to MQTT by this gateway.
+void test_receiveIgnoresOwnPublishedMessages(void)
+{
+    unitTest->publish(&decoded, nodeDB->getNodeId().c_str());
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+    TEST_ASSERT_TRUE(mockRoutingModule->ackNacks_.empty());
+}
+
+// Considers receiving one of our packets an acknowledgement of it being sent: hearing our own
+// packet back on our own gateway topic synthesizes an implicit ACK, delivered locally through
+// sendLocal() -> handleReceived() -> the phone queue, marked as arriving via MQTT transport.
+void test_receiveAcksOwnSentMessages(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.from = myNodeInfo.my_node_num;
+
+    unitTest->publish(&p, nodeDB->getNodeId().c_str());
+
+    // The implicit ACK is delivered locally, never enqueued as MQTT downlink ingress.
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+
+    meshtastic_MeshPacket *ack = mockMeshService->getForPhone();
+    TEST_ASSERT_NOT_NULL(ack);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_decoded_tag, ack->which_payload_variant);
+    TEST_ASSERT_EQUAL(meshtastic_PortNum_ROUTING_APP, ack->decoded.portnum);
+    TEST_ASSERT_EQUAL(myNodeInfo.my_node_num, ack->to);
+    TEST_ASSERT_EQUAL(myNodeInfo.my_node_num, ack->from);
+    TEST_ASSERT_EQUAL(p.id, ack->decoded.request_id);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT, ack->transport_mechanism);
+
+    meshtastic_Routing routing = meshtastic_Routing_init_default;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(ack->decoded.payload.bytes, ack->decoded.payload.size, &meshtastic_Routing_msg, &routing));
+    TEST_ASSERT_EQUAL(meshtastic_Routing_error_reason_tag, routing.which_variant);
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, routing.error_reason);
+
+    mockMeshService->releaseToPool(ack);
+    TEST_ASSERT_NULL(mockMeshService->getForPhone()); // exactly one ACK
+}
+
+// Should ignore our own messages from MQTT that were heard by other nodes.
+void test_receiveIgnoresSentMessagesFromOthers(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.from = myNodeInfo.my_node_num;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+    TEST_ASSERT_TRUE(mockRoutingModule->ackNacks_.empty());
+}
+
+// Decoded MQTT messages should be ignored when encryption is enabled.
+void test_receiveIgnoresDecodedWhenEncryptionEnabled(void)
+{
+    moduleConfig.mqtt.encryption_enabled = true;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Non-encrypted messages for the Admin App should be ignored.
+void test_receiveIgnoresDecodedAdminApp(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.decoded.portnum = meshtastic_PortNum_ADMIN_APP;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+#if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
+// Small decoded broadcast from a remote node, as a plaintext broker would deliver it.
+static meshtastic_MeshPacket makeDecodedBroadcast()
+{
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = 1;
+    p.to = NODENUM_BROADCAST;
+    p.id = 7;
+    p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    p.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p.decoded.payload.size = 5;
+    memcpy(p.decoded.payload.bytes, "hello", 5);
+    return p;
+}
+
+// Decoded (plaintext-broker) downlink skips perhapsDecode's crypto path, so MQTT applies
+// checkXeddsaReceivePolicy at ingress. An unsigned broadcast claiming to come from a node that
+// previously signed must be dropped - without this, a rogue broker peer could impersonate any
+// signing node (audit F3).
+void test_receiveDropsUnsignedBroadcastFromSigner(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_BALANCED;
+    mockNodeDB->emptyNode.bitfield |= NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK;
+
+    const meshtastic_MeshPacket p = makeDecodedBroadcast();
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// The same unsigned broadcast from a node never seen signing is accepted.
+void test_receiveAcceptsUnsignedBroadcastFromNonSigner(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_BALANCED;
+    const meshtastic_MeshPacket p = makeDecodedBroadcast();
+    unitTest->publish(&p);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    TEST_ASSERT_FALSE(mockRouter->packets_.front().xeddsa_signed);
+}
+
+// A validly signed decoded downlink verifies at ingress: delivered with xeddsa_signed set and
+// the sender's signer bit learned.
+void test_receiveVerifiesSignedDecodedDownlink(void)
+{
+    uint8_t pub[32], priv[32];
+    crypto->generateKeyPair(pub, priv);
+    mockNodeDB->emptyNode.public_key.size = 32;
+    memcpy(mockNodeDB->emptyNode.public_key.bytes, pub, 32);
+
+    meshtastic_MeshPacket p = makeDecodedBroadcast();
+    TEST_ASSERT_TRUE(crypto->xeddsa_sign(p.from, p.id, p.to, &p.decoded, p.decoded.xeddsa_signature.bytes));
+    p.decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    TEST_ASSERT_TRUE(mockRouter->packets_.front().xeddsa_signed);
+    TEST_ASSERT_TRUE(mockNodeDB->emptyNode.bitfield & NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK);
+}
+
+// A decoded downlink carrying a signature that fails verification is dropped.
+void test_receiveDropsBadSignatureOnDecodedDownlink(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE;
+    uint8_t pub[32], priv[32];
+    crypto->generateKeyPair(pub, priv);
+    mockNodeDB->emptyNode.public_key.size = 32;
+    memcpy(mockNodeDB->emptyNode.public_key.bytes, pub, 32);
+
+    meshtastic_MeshPacket p = makeDecodedBroadcast();
+    TEST_ASSERT_TRUE(crypto->xeddsa_sign(p.from, p.id, p.to, &p.decoded, p.decoded.xeddsa_signature.bytes));
+    p.decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
+    p.decoded.xeddsa_signature.bytes[0] ^= 0xFF;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+void test_receiveCompatibleAcceptsUnsignedBroadcastFromSigner(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE;
+    mockNodeDB->emptyNode.bitfield |= NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK;
+
+    const meshtastic_MeshPacket p = makeDecodedBroadcast();
+    unitTest->publish(&p);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+}
+
+void test_receiveStrictDropsUnsignedPortnumsAndUnicast(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT;
+    const meshtastic_PortNum ports[] = {
+        meshtastic_PortNum_TEXT_MESSAGE_APP, meshtastic_PortNum_POSITION_APP, meshtastic_PortNum_TELEMETRY_APP,
+        meshtastic_PortNum_NODEINFO_APP,     meshtastic_PortNum_WAYPOINT_APP,
+    };
+    for (const auto port : ports) {
+        meshtastic_MeshPacket p = makeDecodedBroadcast();
+        p.decoded.portnum = port;
+        unitTest->publish(&p);
+    }
+
+    meshtastic_MeshPacket unicast = makeDecodedBroadcast();
+    unicast.to = myNodeInfo.my_node_num;
+    unicast.decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    unitTest->publish(&unicast);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A plaintext broker assertion is not evidence that AES-CCM authentication succeeded locally.
+void test_receiveStrictDoesNotTrustDecodedPkiFlag(void)
+{
+    config.security.packet_signature_policy =
+        meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT;
+    meshtastic_MeshPacket p = makeDecodedBroadcast();
+    p.to = myNodeInfo.my_node_num;
+    p.pki_encrypted = true;
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+#endif // !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
+
+// Only the same fields that are transmitted over LoRa should be set in MQTT messages.
+void test_receiveIgnoresUnexpectedFields(void)
+{
+    meshtastic_MeshPacket input = decoded;
+    input.rx_snr = 10;
+    input.rx_rssi = 20;
+
+    unitTest->publish(&input);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &p = mockRouter->packets_.front();
+    TEST_ASSERT_EQUAL(0, p.rx_snr);
+    TEST_ASSERT_EQUAL(0, p.rx_rssi);
+}
+
+// Messages with an invalid hop_limit are ignored.
+void test_receiveIgnoresInvalidHopLimit(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.hop_limit = 10;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// ===========================================================================
+// Downlink acceptance gates - shouldDropMqttDownlink + onReceiveProto policy
+// ===========================================================================
+
+// hop_start above HOP_MAX is rejected even when hop_limit is valid.
+void test_receiveIgnoresInvalidHopStart(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.hop_start = 10;
+    p.hop_limit = 3;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// The ignore_mqtt kill-switch drops every MQTT downlink.
+void test_receiveDropsWhenIgnoreMqttSet(void)
+{
+    config.lora.ignore_mqtt = true;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A sender listed in config.lora.ignore_incoming is dropped.
+void test_receiveDropsSenderInIgnoreIncomingList(void)
+{
+    config.lora.ignore_incoming_count = 1;
+    config.lora.ignore_incoming[0] = decoded.from;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A non-empty ignore list only drops matching senders - presence of the list alone must not drop.
+void test_receiveAcceptsSenderNotInIgnoreIncomingList(void)
+{
+    config.lora.ignore_incoming_count = 2;
+    config.lora.ignore_incoming[0] = 99;
+    config.lora.ignore_incoming[1] = 100;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+}
+
+// A sender whose NodeDB entry carries the is_ignored bit is dropped (resurrect-ignored-node guard).
+void test_receiveDropsNodeDbIgnoredSender(void)
+{
+    mockNodeDB->emptyNode.bitfield |= NODEINFO_BITFIELD_IS_IGNORED_MASK;
+
+    unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A packet claiming the broadcast address as its source is dropped.
+void test_receiveDropsBroadcastSource(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.from = NODENUM_BROADCAST;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+    TEST_ASSERT_TRUE(mockRoutingModule->ackNacks_.empty());
+}
+
+// A broker cannot assert PKI authentication or a transport: every accepted downlink is laundered
+// to pki_encrypted=false + TRANSPORT_MQTT + via_mqtt=true. pki_encrypted grants admin-level trust
+// downstream, so a regression here is remote privilege escalation.
+void test_receiveLaundersPkiAndTransportFields(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.pki_encrypted = true;
+    p.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+
+    unitTest->publish(&p);
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &r = mockRouter->packets_.front();
+    TEST_ASSERT_FALSE(r.pki_encrypted);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT, r.transport_mechanism);
+    TEST_ASSERT_TRUE(r.via_mqtt);
+}
+
+// PKI-topic envelopes are dropped when no channel has downlink enabled, even when addressed to us.
+void test_receiveDropsPkiTopicWhenNoChannelHasDownlink(void)
+{
+    channelFile.channels[0].settings.downlink_enabled = false;
+    meshtastic_MeshPacket e = encrypted;
+    e.to = myNodeInfo.my_node_num;
+
+    unitTest->publish(&e, "!87654321", "PKI");
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Any single downlink-enabled channel (here only a secondary) is enough to admit PKI envelopes.
+void test_receiveAcceptsPkiTopicWithOnlySecondaryDownlink(void)
+{
+    channelFile.channels[0].settings.downlink_enabled = false;
+    channelFile.channels[1] = meshtastic_Channel{
+        .index = 1,
+        .has_settings = true,
+        .settings = {.name = "second", .downlink_enabled = true},
+        .role = meshtastic_Channel_Role_SECONDARY,
+    };
+    channelFile.channels_count = 2;
+    channels.onConfigChanged();
+    meshtastic_MeshPacket e = encrypted;
+    e.to = myNodeInfo.my_node_num;
+
+    unitTest->publish(&e, "!87654321", "PKI");
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+}
+
+// An encrypted PKI envelope not addressed to us needs both endpoints known with user info.
+void test_receiveDropsPkiNotToUsWithUnknownEndpoints(void)
+{
+    unitTest->publish(&encrypted, "!87654321", "PKI"); // to=2; neither endpoint has user info
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+void test_receiveAcceptsPkiNotToUsWithKnownEndpoints(void)
+{
+    // MockNodeDB serves the same node for every NodeNum, so this marks both endpoints known.
+    mockNodeDB->emptyNode.bitfield |= NODEINFO_BITFIELD_HAS_USER_MASK;
+
+    unitTest->publish(&encrypted, "!87654321", "PKI");
+
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    const meshtastic_MeshPacket &r = mockRouter->packets_.front();
+    TEST_ASSERT_TRUE(r.via_mqtt);
+    TEST_ASSERT_FALSE(r.pki_encrypted); // laundered even on the PKI topic
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT, r.transport_mechanism);
+}
+
+// The endpoint gate is an AND: knowing only the sender (from=1) while the receiver (to=2) is
+// unknown must still drop. Distinguishes && from || in the MQTT.cpp acceptance rule.
+void test_receiveDropsPkiNotToUsWithOnlySenderKnown(void)
+{
+    mockNodeDB->nodes_[1].bitfield |= NODEINFO_BITFIELD_HAS_USER_MASK; // only from=1 known; to=2 stays unknown
+
+    unitTest->publish(&encrypted, "!87654321", "PKI");
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// An envelope naming a channel we do not have is dropped, even though getByName falls back to
+// the primary channel - the case-sensitive global-id recheck must refuse the substitution.
+void test_receiveDropsUnknownChannelName(void)
+{
+    unitTest->publish(&decoded, "!87654321", "nope");
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// getByName matches case-insensitively, but the downlink gate compares case-sensitively; a
+// mixed-case channel_id must not ride the primary channel's downlink permission.
+void test_receiveDropsCaseMismatchedChannelName(void)
+{
+    unitTest->publish(&decoded, "!87654321", "TEST");
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// A validly-decoding envelope missing channel_id is rejected before any gate runs.
+void test_receiveRejectsEnvelopeWithoutChannelId(void)
+{
+    const meshtastic_ServiceEnvelope env = {.packet = const_cast<meshtastic_MeshPacket *>(&decoded),
+                                            .channel_id = NULL,
+                                            .gateway_id = const_cast<char *>("!87654321")};
+    uint8_t bytes[256];
+    const size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
+    unitTest->deliverRaw("msh/2/e/test/!87654321", bytes, numBytes);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Every strict prefix of a valid envelope must be rejected: either the truncated decode fails, or
+// it succeeds with gateway_id (the last-encoded field) missing and the NULL check refuses it.
+void test_receiveRejectsTruncatedEnvelope(void)
+{
+    const meshtastic_ServiceEnvelope env = {.packet = const_cast<meshtastic_MeshPacket *>(&decoded),
+                                            .channel_id = const_cast<char *>("test"),
+                                            .gateway_id = const_cast<char *>("!87654321")};
+    uint8_t bytes[256];
+    const size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
+    TEST_ASSERT_TRUE(numBytes > 0);
+
+    for (size_t n = 1; n < numBytes; n++)
+        unitTest->deliverRaw("msh/2/e/test/!87654321", bytes, n);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Publishing to a text channel.
+void test_publishTextMessageDirect(void)
+{
+    TEST_ASSERT_TRUE(mqtt->publish(MockPubSubServer::kTextTopic, "payload", 0));
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    TEST_ASSERT_EQUAL_STRING("payload", std::get<std::string>(payload).c_str());
+}
+
+// Publishing to a text channel via the MQTT client proxy.
+void test_publishTextMessageWithProxy(void)
+{
+    moduleConfig.mqtt.proxy_to_client_enabled = true;
+
+    TEST_ASSERT_TRUE(mqtt->publish(MockPubSubServer::kTextTopic, "payload", 0));
+
+    TEST_ASSERT_EQUAL(1, mockMeshService->messages_.size());
+    const meshtastic_MqttClientProxyMessage &message = mockMeshService->messages_.front();
+    TEST_ASSERT_EQUAL_STRING(MockPubSubServer::kTextTopic, message.topic);
+    TEST_ASSERT_EQUAL(meshtastic_MqttClientProxyMessage_text_tag, message.which_payload_variant);
+    TEST_ASSERT_EQUAL_STRING("payload", message.payload_variant.text);
+}
+
+// Helper method to verify the expected latitude/longitude was received.
+void verifyLatLong(const DecodedServiceEnvelope &env, uint32_t latitude, uint32_t longitude)
+{
+    TEST_ASSERT_TRUE(env.validDecode);
+    const meshtastic_MeshPacket &p = *env.packet;
+    TEST_ASSERT_EQUAL(NODENUM_BROADCAST, p.to);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_decoded_tag, p.which_payload_variant);
+    TEST_ASSERT_EQUAL(meshtastic_PortNum_MAP_REPORT_APP, p.decoded.portnum);
+
+    meshtastic_MapReport mapReport;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_MapReport_msg, &mapReport));
+    TEST_ASSERT_EQUAL(latitude, mapReport.latitude_i);
+    TEST_ASSERT_EQUAL(longitude, mapReport.longitude_i);
+}
+
+// Map reporting defaults to an imprecise location.
+void test_reportToMapDefaultImprecise(void)
+{
+    unitTest->reportToMap();
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    TEST_ASSERT_EQUAL_STRING("msh/2/map/", topic.c_str());
+}
+
+void test_eventPrimaryMapReportFollowsCompileTimePolicy(void)
+{
+    configureCoordinatePolicyChannels();
+    clearPublicationState();
+
+    unitTest->reportToMap();
+
+#if USERPREFS_BLOCK_POSITION_ON_EVENT_CHANNEL && defined(USERPREFS_CHANNEL_0_PSK)
+    TEST_ASSERT_TRUE(pubsub->published_.empty());
+    TEST_ASSERT_EQUAL(0, unitTest->queueSize());
+#else
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+#endif
+}
+
+void test_privatePrimaryMapReportStillPublishesWithEventPolicy(void)
+{
+    configureCoordinatePolicyChannels(false);
+    clearPublicationState();
+
+    unitTest->reportToMap();
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    TEST_ASSERT_EQUAL_STRING("msh/2/map/", pubsub->published_.front().first.c_str());
+}
+
+// Location is sent over the phone proxy.
+void test_reportToMapImpreciseProxied(void)
+{
+    moduleConfig.mqtt.proxy_to_client_enabled = true;
+    MQTTUnitTest::restart();
+
+    unitTest->reportToMap(/*precision=*/14);
+
+    TEST_ASSERT_EQUAL(1, mockMeshService->messages_.size());
+    const meshtastic_MqttClientProxyMessage &message = mockMeshService->messages_.front();
+    TEST_ASSERT_EQUAL_STRING("msh/2/map/", message.topic);
+    TEST_ASSERT_EQUAL(meshtastic_MqttClientProxyMessage_data_tag, message.which_payload_variant);
+    const DecodedServiceEnvelope env(message.payload_variant.data.bytes, message.payload_variant.data.size);
+}
+
+// isUsingDefaultServer returns true when using the default server.
+void test_usingDefaultServer(void)
+{
+    TEST_ASSERT_TRUE(mqtt->isUsingDefaultServer());
+}
+
+// isUsingDefaultServer returns true when using the default server and a port.
+void test_usingDefaultServerWithPort(void)
+{
+    std::string server = default_mqtt_address;
+    server += ":1883";
+    strcpy(moduleConfig.mqtt.address, server.c_str());
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_TRUE(mqtt->isUsingDefaultServer());
+}
+
+// isUsingDefaultServer returns true when using the default server and invalid port.
+void test_usingDefaultServerWithInvalidPort(void)
+{
+    std::string server = default_mqtt_address;
+    server += ":invalid";
+    strcpy(moduleConfig.mqtt.address, server.c_str());
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_TRUE(mqtt->isUsingDefaultServer());
+}
+
+// isUsingDefaultServer returns false when not using the default server.
+void test_usingCustomServer(void)
+{
+    strcpy(moduleConfig.mqtt.address, "custom");
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_FALSE(mqtt->isUsingDefaultServer());
+}
+
+// Test that isEnabled returns true the MQTT module is enabled.
+void test_enabled(void)
+{
+    TEST_ASSERT_TRUE(mqtt->isEnabled());
+}
+
+// Test that isEnabled returns false the MQTT module not enabled.
+void test_disabled(void)
+{
+    moduleConfig.mqtt.enabled = false;
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_FALSE(mqtt->isEnabled());
+}
+
+void test_mqttInitSkipsAllocationWhenDisabled(void)
+{
+    delete unitTest;
+    mqtt = unitTest = NULL;
+
+    moduleConfig.mqtt.enabled = false;
+    mqttInit();
+
+    TEST_ASSERT_NULL(mqtt);
+}
+
+// Subscriptions contain the moduleConfig.mqtt.root prefix.
+void test_customMqttRoot(void)
+{
+    strcpy(moduleConfig.mqtt.root, "custom");
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_TRUE(loopUntil(
+        [] { return pubsub->subscriptions_.count("custom/2/e/test/+") && pubsub->subscriptions_.count("custom/2/e/PKI/+"); }));
+}
+
+// A LoRa region change rewrites moduleConfig.mqtt.root without telling MQTT (AdminModule, MenuHandler,
+// InkHUD). MQTT must pick it up, rebuild the topics and resubscribe; otherwise the node keeps
+// publishing and subscribing under the old region's root until reboot. An uplink sent before
+// runOnce() runs must already use the new root.
+void test_rootChange_rebuildsTopics(void)
+{
+    // Start MQTT with a US region root.
+    strcpy(moduleConfig.mqtt.root, "msh/US");
+    MQTTUnitTest::restart();
+
+    TEST_ASSERT_TRUE(loopUntil(
+        [] { return pubsub->subscriptions_.count("msh/US/2/e/test/+") && pubsub->subscriptions_.count("msh/US/2/e/PKI/+"); }));
+
+    // Simulate region change: only the root changes, nobody notifies MQTT.
+    strcpy(moduleConfig.mqtt.root, "msh/EU_868");
+    pubsub->subscriptions_.clear();
+    pubsub->published_.clear();
+    mqtt->onSend(encrypted, decoded, 0);
+
+    // Subscriptions are refreshed, and the uplink is published under the new root after the reconnect.
+    TEST_ASSERT_TRUE(loopUntil([] {
+        return pubsub->subscriptions_.count("msh/EU_868/2/e/test/+") && pubsub->subscriptions_.count("msh/EU_868/2/e/PKI/+") &&
+               !pubsub->published_.empty();
+    }));
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    TEST_ASSERT_EQUAL_STRING("msh/EU_868/2/e/test/!12345678", topic.c_str());
+}
+
+// The "<root>/<region>" suffix (msh/US, msh/EU_868) is a convention of the default Meshtastic broker, so a
+// region change only rewrites the root there, and only when the root is still the default one. Guards against
+// clobbering a root the user chose (including one that merely starts with "msh"), and against moving a private
+// broker's topics, which are regional already if they need to be.
+void test_applyRegionRootTopic_rewritesDefaultBrokerRootsOnly(void)
+{
+    strcpy(moduleConfig.mqtt.root, "msh/US");
+    TEST_ASSERT_TRUE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/EU_868", moduleConfig.mqtt.root);
+
+    strcpy(moduleConfig.mqtt.root, default_mqtt_root);
+    TEST_ASSERT_TRUE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/EU_868", moduleConfig.mqtt.root);
+
+    // An empty root is the default too: MQTT falls back to "msh" when building its topics.
+    moduleConfig.mqtt.root[0] = '\0';
+    strcpy(moduleConfig.mqtt.address, default_mqtt_address);
+    TEST_ASSERT_TRUE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/EU_868", moduleConfig.mqtt.root);
+
+    // The default broker with an explicit port is still the default broker.
+    strcpy(moduleConfig.mqtt.address, default_mqtt_address ":1883");
+    strcpy(moduleConfig.mqtt.root, "msh/US");
+    TEST_ASSERT_TRUE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/EU_868", moduleConfig.mqtt.root);
+
+    // A root of the user's own is left alone, even when it starts with "msh".
+    strcpy(moduleConfig.mqtt.root, "msh/home");
+    TEST_ASSERT_FALSE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/home", moduleConfig.mqtt.root);
+
+    // A private broker keeps its topics across a region change.
+    strcpy(moduleConfig.mqtt.address, "mqtt.example.org");
+    strcpy(moduleConfig.mqtt.root, "msh/US");
+    TEST_ASSERT_FALSE(MQTT::applyRegionRootTopic("EU_868"));
+    TEST_ASSERT_EQUAL_STRING("msh/US", moduleConfig.mqtt.root);
+}
+
+// USERPREFS_EVENT_MODE gates the public broker on isUsingDefaultRootTopic() (Channels::anyMqttEnabled()).
+// A "msh/<region>" root is what a region change writes on the default broker, so it has to keep counting as
+// the default root; otherwise an event build silently loses that guard the first time the region changes.
+void test_regionRootTopic_countsAsTheDefaultRoot(void)
+{
+    strcpy(moduleConfig.mqtt.root, "msh/EU_868");
+    MQTTUnitTest::restart();
+    TEST_ASSERT_TRUE(mqtt->isUsingDefaultRootTopic());
+
+    strcpy(moduleConfig.mqtt.root, "msh/home");
+    MQTTUnitTest::restart();
+    TEST_ASSERT_FALSE(mqtt->isUsingDefaultRootTopic());
+}
+
+// Empty configuration is valid.
+void test_configEmptyIsValid(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {};
+
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+}
+
+// Empty 'enabled' configuration is valid. A lightweight TCP check may be performed
+// but does not affect the result.
+void test_configEnabledEmptyIsValid(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.enabled = true};
+
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+}
+
+// Configuration with the default server is valid.
+void test_configWithDefaultServer(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.address = default_mqtt_address};
+
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+}
+
+// Configuration with the default server and port 8888 is invalid.
+void test_configWithDefaultServerAndInvalidPort(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.address = default_mqtt_address ":8888"};
+
+    TEST_ASSERT_FALSE(MQTT::isValidConfig(config));
+}
+
+// Custom host and port is valid. TCP reachability is checked but does not block saving.
+void test_configCustomHostAndPort(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.enabled = true, .address = "server:1234"};
+
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+}
+
+// An unreachable server is still a valid config - settings always save.
+// A warning notification is sent in non-test builds, but isValidConfig returns true.
+void test_configWithUnreachableServerIsStillValid(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.enabled = true, .address = "server"};
+
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+}
+
+// isValidConfig returns true when tls_enabled is supported, or false otherwise.
+void test_configWithTLSEnabled(void)
+{
+    meshtastic_ModuleConfig_MQTTConfig config = {.enabled = true, .address = "server", .tls_enabled = true};
+
+#if MQTT_SUPPORTS_TLS
+    TEST_ASSERT_TRUE(MQTT::isValidConfig(config));
+#else
+    TEST_ASSERT_FALSE(MQTT::isValidConfig(config));
+#endif
+}
+
+// ===========================================================================
+// Fuzz - adversarial MQTT downlink ingress (the non-RF path a broker can push)
+// ===========================================================================
+// Blitzes the onReceiveProto() chain with (a) raw garbage that must fail envelope decode cleanly and
+// (b) well-formed envelopes wrapping crafted inner packets. Contract: no crash, at most one enqueue per envelope.
+constexpr uint64_t MQTT_FUZZ_SEED = 0x00E3A71C0FULL;
+
+void test_receiveFuzzServiceEnvelope(void)
+{
+    printf("  seed=0x%llx\n", (unsigned long long)MQTT_FUZZ_SEED);
+    rngSeed(MQTT_FUZZ_SEED);
+
+    const char *channelIds[] = {"test", "PKI", "nope", ""};
+    const char *gatewayIds[] = {"!12345678", "!87654321", "!00000000"}; // [0] == our node id -> self path
+
+    for (unsigned k = 0; k < 4000; k++) {
+        if (rngRange(3) == 0) {
+            // (a) Raw bytes: mostly random, must be rejected at DecodedServiceEnvelope without crashing.
+            uint8_t raw[128];
+            size_t n = rngRange(sizeof(raw) + 1);
+            rngFill(raw, n);
+            unitTest->deliverRaw("msh/2/e/test/!87654321", raw, n);
+        } else {
+            // (b) Well-formed envelope around a crafted inner packet.
+            meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+            p.from = (rngRange(3) == 0) ? myNodeInfo.my_node_num : rngNext(); // self origin hits isFromUs
+            p.to = (rngRange(2)) ? myNodeInfo.my_node_num : rngNext();
+            p.id = rngNext();
+            p.channel = (uint8_t)rngByte();
+            p.hop_limit = (uint8_t)rngRange(10); // includes > HOP_MAX (the invalid-hop reject path)
+            p.hop_start = (uint8_t)rngRange(10);
+            p.want_ack = (rngRange(2) == 0);
+            p.pki_encrypted = (rngRange(2) == 0);
+            if (rngRange(2) == 0) {
+                p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+                p.decoded.portnum = (rngRange(6) == 0) ? meshtastic_PortNum_ADMIN_APP : (meshtastic_PortNum)rngRange(80);
+                p.decoded.want_response = (rngRange(2) == 0);
+                p.decoded.has_bitfield = (rngRange(2) == 0);
+                p.decoded.bitfield = (uint32_t)rngNext();
+                p.decoded.payload.size = rngRange(64);
+                rngFill(p.decoded.payload.bytes, p.decoded.payload.size);
+            } else {
+                p.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+                p.encrypted.size = rngRange(64);
+                rngFill(p.encrypted.bytes, p.encrypted.size);
+            }
+            unitTest->publish(&p, gatewayIds[rngRange(3)], channelIds[rngRange(4)]);
+        }
+
+        // A single envelope reaches at most one enqueueReceivedMessage; more would be a routing bug.
+        TEST_ASSERT_TRUE_MESSAGE(mockRouter->packets_.size() <= 1, "MQTT downlink enqueued >1 packet per envelope");
+        // Drain capture lists so 4000 iterations stay bounded (values already released to their pools).
+        mockRouter->packets_.clear();
+        mockRoutingModule->ackNacks_.clear();
+        mockMeshService->messages_.clear();
+        mockMeshService->notifications_.clear();
+    }
+}
+
+void setup()
+{
+    initializeTestEnvironment();
+    nodeDB = mockNodeDB = new MockNodeDB(); // freed implicitly by exit(UNITY_END()) below
+
+    UNITY_BEGIN();
+    RUN_TEST(test_sendDirectlyConnectedDecoded);
+    RUN_TEST(test_sendDirectlyConnectedEncrypted);
+    RUN_TEST(test_eventPositionPublicationFollowsCompileTimePolicy);
+    RUN_TEST(test_privatePositionStillPublishesWithEventPolicy);
+    RUN_TEST(test_explicitPkiPositionStillPublishesWithEventPolicy);
+    RUN_TEST(test_proxyToMeshServiceDecoded);
+    RUN_TEST(test_proxyToMeshServiceEncrypted);
+    RUN_TEST(test_dontMqttMeOnPublicServer);
+    RUN_TEST(test_okToMqttOnPrivateServer);
+    RUN_TEST(test_noRangeTestAppOnDefaultServer);
+    RUN_TEST(test_noDetectionSensorAppOnDefaultServer);
+    RUN_TEST(test_sendQueued);
+    RUN_TEST(test_reconnectProxyDoesNotReconnectMqtt);
+    RUN_TEST(test_receiveEmptyMeshPacket);
+    RUN_TEST(test_receiveDecodedProto);
+    RUN_TEST(test_receiveDecodedProtoFromProxy);
+    RUN_TEST(test_receiveEmptyDataFromProxy);
+    RUN_TEST(test_receiveTextVariantFromProxyIsNotReadAsBytes);
+    RUN_TEST(test_receiveNoVariantFromProxyIsIgnored);
+    RUN_TEST(test_receiveWithoutChannelDownlink);
+    RUN_TEST(test_receiveEncryptedPKITopicToUs);
+    RUN_TEST(test_receiveIgnoresOwnPublishedMessages);
+    RUN_TEST(test_receiveAcksOwnSentMessages);
+    RUN_TEST(test_receiveIgnoresSentMessagesFromOthers);
+    RUN_TEST(test_receiveIgnoresDecodedWhenEncryptionEnabled);
+    RUN_TEST(test_receiveIgnoresDecodedAdminApp);
+#if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
+    RUN_TEST(test_receiveDropsUnsignedBroadcastFromSigner);
+    RUN_TEST(test_receiveAcceptsUnsignedBroadcastFromNonSigner);
+    RUN_TEST(test_receiveVerifiesSignedDecodedDownlink);
+    RUN_TEST(test_receiveDropsBadSignatureOnDecodedDownlink);
+    RUN_TEST(test_receiveCompatibleAcceptsUnsignedBroadcastFromSigner);
+    RUN_TEST(test_receiveStrictDropsUnsignedPortnumsAndUnicast);
+    RUN_TEST(test_receiveStrictDoesNotTrustDecodedPkiFlag);
+#endif
+    RUN_TEST(test_receiveIgnoresUnexpectedFields);
+    RUN_TEST(test_receiveIgnoresInvalidHopLimit);
+    RUN_TEST(test_receiveIgnoresInvalidHopStart);
+    RUN_TEST(test_receiveDropsWhenIgnoreMqttSet);
+    RUN_TEST(test_receiveDropsSenderInIgnoreIncomingList);
+    RUN_TEST(test_receiveAcceptsSenderNotInIgnoreIncomingList);
+    RUN_TEST(test_receiveDropsNodeDbIgnoredSender);
+    RUN_TEST(test_receiveDropsBroadcastSource);
+    RUN_TEST(test_receiveLaundersPkiAndTransportFields);
+    RUN_TEST(test_receiveDropsPkiTopicWhenNoChannelHasDownlink);
+    RUN_TEST(test_receiveAcceptsPkiTopicWithOnlySecondaryDownlink);
+    RUN_TEST(test_receiveDropsPkiNotToUsWithUnknownEndpoints);
+    RUN_TEST(test_receiveAcceptsPkiNotToUsWithKnownEndpoints);
+    RUN_TEST(test_receiveDropsPkiNotToUsWithOnlySenderKnown);
+    RUN_TEST(test_receiveDropsUnknownChannelName);
+    RUN_TEST(test_receiveDropsCaseMismatchedChannelName);
+    RUN_TEST(test_receiveRejectsEnvelopeWithoutChannelId);
+    RUN_TEST(test_receiveRejectsTruncatedEnvelope);
+    RUN_TEST(test_receiveFuzzServiceEnvelope);
+    RUN_TEST(test_publishTextMessageDirect);
+    RUN_TEST(test_publishTextMessageWithProxy);
+    RUN_TEST(test_reportToMapDefaultImprecise);
+    RUN_TEST(test_eventPrimaryMapReportFollowsCompileTimePolicy);
+    RUN_TEST(test_privatePrimaryMapReportStillPublishesWithEventPolicy);
+    RUN_TEST(test_reportToMapImpreciseProxied);
+    RUN_TEST(test_usingDefaultServer);
+    RUN_TEST(test_usingDefaultServerWithPort);
+    RUN_TEST(test_usingDefaultServerWithInvalidPort);
+    RUN_TEST(test_usingCustomServer);
+    RUN_TEST(test_enabled);
+    RUN_TEST(test_disabled);
+    RUN_TEST(test_mqttInitSkipsAllocationWhenDisabled);
+    RUN_TEST(test_customMqttRoot);
+    RUN_TEST(test_rootChange_rebuildsTopics);
+    RUN_TEST(test_applyRegionRootTopic_rewritesDefaultBrokerRootsOnly);
+    RUN_TEST(test_regionRootTopic_countsAsTheDefaultRoot);
+    RUN_TEST(test_configEmptyIsValid);
+    RUN_TEST(test_configEnabledEmptyIsValid);
+    RUN_TEST(test_configWithDefaultServer);
+    RUN_TEST(test_configWithDefaultServerAndInvalidPort);
+    RUN_TEST(test_configCustomHostAndPort);
+    RUN_TEST(test_configWithUnreachableServerIsStillValid);
+    RUN_TEST(test_configWithTLSEnabled);
+    exit(UNITY_END());
+}
+#else
+void setup()
+{
+    initializeTestEnvironment();
+    LOG_WARN("This test requires the ARCH_PORTDUINO variant of WiFiClient");
+    UNITY_BEGIN();
+    exit(UNITY_END());
+}
+#endif
+void loop() {}

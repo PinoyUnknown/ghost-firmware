@@ -1,0 +1,455 @@
+/**
+ * @file FSCommon.cpp
+ * @brief This file contains functions for common filesystem operations such as copying, renaming, listing and deleting files and
+ * directories.
+ *
+ * The functions in this file are used to perform common filesystem operations such as copying, renaming, listing and deleting
+ * files and directories. These functions are used in the Meshtastic-device project to manage files and directories on the
+ * device's filesystem.
+ *
+ */
+#include "FSCommon.h"
+#include "SPILock.h"
+#include "configuration.h"
+
+#if defined(ARCH_PORTDUINO)
+#include <filesystem>
+#endif
+
+#if defined(ARCH_NRF52) || defined(ARCH_STM32)
+// Adafruit_LittleFS (nRF52) and STM32_LittleFS both wrap littlefs v1, which predates lfs_fs_size().
+// Count the blocks currently in use with lfs_traverse() instead.
+static int fsCountBlockCb(void *ctx, lfs_block_t)
+{
+    *static_cast<size_t *>(ctx) += 1;
+    return 0;
+}
+
+size_t fsTotalBytes()
+{
+    lfs_t *fs = FSCom._getFS();
+    if (!fs || !fs->cfg)
+        return 0;
+    return (size_t)fs->cfg->block_count * (size_t)fs->cfg->block_size;
+}
+
+size_t fsUsedBytes()
+{
+    lfs_t *fs = FSCom._getFS();
+    if (!fs || !fs->cfg)
+        return 0;
+    size_t blocks = 0;
+    FSCom._lockFS();
+#if LFS_VERSION_MAJOR >= 2
+    int err = lfs_fs_traverse(fs, fsCountBlockCb, &blocks);
+#else
+    int err = lfs_traverse(fs, fsCountBlockCb, &blocks);
+#endif
+    FSCom._unlockFS();
+    if (err < 0)
+        return fsTotalBytes(); // report "full" so capacity checks fail safe
+    return blocks * (size_t)fs->cfg->block_size;
+}
+#elif defined(ARCH_RP2040)
+// arduino-pico reports capacity through FSInfo rather than as methods.
+size_t fsTotalBytes()
+{
+    FSInfo info;
+    return FSCom.info(info) ? (size_t)info.totalBytes : 0;
+}
+
+size_t fsUsedBytes()
+{
+    FSInfo info;
+    return FSCom.info(info) ? (size_t)info.usedBytes : 0;
+}
+#elif defined(ARCH_PORTDUINO)
+// Portduino is backed by the host filesystem; ask the OS about the volume holding the working
+// directory. std::filesystem keeps this working on native-windows too, where statvfs() does not
+// exist. On error we report "full" so capacity checks fail safe.
+size_t fsTotalBytes()
+{
+    std::error_code ec;
+    const auto info = std::filesystem::space(".", ec);
+    return ec ? 0 : (size_t)info.capacity;
+}
+
+size_t fsUsedBytes()
+{
+    std::error_code ec;
+    const auto info = std::filesystem::space(".", ec);
+    if (ec || info.capacity < info.available)
+        return fsTotalBytes();
+    return (size_t)(info.capacity - info.available);
+}
+#else
+// ESP32 LittleFS and the nRF54L15 wrapper expose these directly.
+size_t fsTotalBytes()
+{
+    return FSCom.totalBytes();
+}
+
+size_t fsUsedBytes()
+{
+    return FSCom.usedBytes();
+}
+#endif
+
+// Software SPI is used by MUI so disable SD card here until it's also implemented
+#if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI)
+#include <SD.h>
+#include <SPI.h>
+
+#ifdef SDCARD_USE_SPI1
+SPIClass SPI_HSPI(HSPI);
+#define SDHandler SPI_HSPI
+#else
+#define SDHandler SPI
+#endif
+
+#ifndef SD_SPI_FREQUENCY
+#define SD_SPI_FREQUENCY 4000000U
+#endif
+
+#endif // HAS_SDCARD
+
+/**
+ * Renames a file from pathFrom to pathTo.
+ *
+ * @param pathFrom The original path of the file.
+ * @param pathTo The new path of the file.
+ *
+ * @return True if the file was successfully renamed, false otherwise.
+ */
+bool renameFile(const char *pathFrom, const char *pathTo)
+{
+#ifdef FSCom
+    spiLock->lock();
+    bool result = FSCom.rename(pathFrom, pathTo);
+    spiLock->unlock();
+    return result;
+#else
+    return false;
+#endif
+}
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+/**
+ * @brief Platform-agnostic filesystem format / wipe.
+ *
+ * On embedded targets (ESP32, NRF52, STM32WL, RP2040) this calls the
+ * native FSCom.format() which erases and reinitialises the LittleFS
+ * partition.
+ *
+ * On Portduino the fs::FS backend has no format() method. We instead
+ * delete /prefs (the only meshtastic data directory written at runtime)
+ * and return. rmDir("/prefs") is already called unconditionally by
+ * factoryReset() so this is a proven primitive on Portduino.
+ * FSBegin() is a no-op (#define FSBegin() true) on Portduino.
+ *
+ * @return true on success, false on failure or if no filesystem is configured.
+ */
+bool fsFormat()
+{
+#ifdef FSCom
+#if defined(ARCH_PORTDUINO)
+    rmDir("/prefs");
+    return FSBegin();
+#else
+    return FSCom.format();
+#endif
+#else
+    return false;
+#endif
+}
+
+#ifdef FSCom
+namespace
+{
+bool pathEndsWithDot(const char *path)
+{
+    if (!path)
+        return false;
+
+    size_t length = strlen(path);
+    return length > 0 && path[length - 1] == '.';
+}
+
+bool copyFilePath(char *dest, size_t destSize, const char *path, bool *wasLimited)
+{
+    if (!path || destSize == 0) {
+        if (wasLimited)
+            *wasLimited = true;
+        return false;
+    }
+
+    if (strlcpy(dest, path, destSize) >= destSize) {
+        if (wasLimited)
+            *wasLimited = true;
+        return false;
+    }
+
+    return true;
+}
+
+void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vector<meshtastic_FileInfo> &filenames,
+                  bool *wasLimited)
+{
+    if (!dirname)
+        return;
+
+    File root = FSCom.open(dirname, FILE_O_READ);
+    if (!root)
+        return;
+    if (!root.isDirectory()) {
+        root.close();
+        return;
+    }
+
+    File file = root.openNextFile();
+    // file.name()[0] check is a workaround for a bug in the Adafruit LittleFS nrf52 glue (see issue 4395)
+    while (file && file.name()[0]) {
+        if (filenames.size() >= maxCount) {
+            if (wasLimited)
+                *wasLimited = true;
+            file.close();
+            break;
+        }
+        const char *fileName = file.name();
+        if (file.isDirectory() && !pathEndsWithDot(fileName)) {
+            char pathBuffer[sizeof(((meshtastic_FileInfo *)nullptr)->file_name)] = {};
+#ifdef ARCH_ESP32
+            const char *subDirPath = file.path();
+#else
+            const char *subDirPath = fileName;
+#endif
+            bool hasSubDirPath = copyFilePath(pathBuffer, sizeof(pathBuffer), subDirPath, wasLimited);
+            file.close();
+
+            if (levels && hasSubDirPath) {
+                collectFiles(pathBuffer, levels - 1, maxCount, filenames, wasLimited);
+            } else if (wasLimited) {
+                *wasLimited = true;
+            }
+        } else {
+            meshtastic_FileInfo fileInfo = {"", static_cast<uint32_t>(file.size())};
+#ifdef ARCH_ESP32
+            bool hasFilePath = copyFilePath(fileInfo.file_name, sizeof(fileInfo.file_name), file.path(), wasLimited);
+#else
+            bool hasFilePath = copyFilePath(fileInfo.file_name, sizeof(fileInfo.file_name), file.name(), wasLimited);
+#endif
+            if (hasFilePath && !pathEndsWithDot(fileInfo.file_name)) {
+                filenames.push_back(fileInfo);
+            }
+            file.close();
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+}
+} // namespace
+#endif
+
+/**
+ * @brief Get the list of files in a directory.
+ *
+ * This function returns a list of files in a directory. The list includes the full path of each file.
+ * We can't use SPILOCK here because of recursion. Callers of this function should use SPILOCK.
+ *
+ * @param dirname The name of the directory.
+ * @param levels The number of levels of subdirectories to list.
+ * @param maxCount The maximum number of files to collect before truncating the walk.
+ * @param wasLimited Optional out-param, set to true if the listing was truncated (by maxCount or low memory).
+ * @return A vector of meshtastic_FileInfo for each file in the directory.
+ */
+std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount, bool *wasLimited)
+{
+    std::vector<meshtastic_FileInfo> filenames = {};
+    if (wasLimited)
+        *wasLimited = false;
+#ifdef FSCom
+    // Size the vector once, up front, to what the heap can actually hand out, and cap the walk at that
+    // count so push_back() never has to grow it. Any allocation that fails here goes through operator
+    // new and raises std::bad_alloc; the ESP32 framework is built with CONFIG_COMPILER_CXX_EXCEPTIONS=n,
+    // so there is no unwinder and a throw is std::terminate() -> abort() -> reboot. That fires on the
+    // very first client handshake whenever the heap is fragmented (WiFi + TLS up, no PSRAM), which is
+    // exactly when this runs. So: never let reserve() be the thing that discovers there is no room.
+    // Cap at what a vector of FileInfo can hold at all: it keeps the probe's byte count from wrapping
+    // for a huge maxCount, and it is also the bound reserve() would otherwise reject with a throw.
+    size_t reservedCount = std::min(maxCount, filenames.max_size());
+    // Probe with malloc() - the allocation that returns nullptr on failure under every build (new(std::nothrow)
+    // is not that: libstdc++ implements it as a try/catch around the throwing form) - free the probe, and
+    // reserve the size that fit. Not airtight against a concurrent allocator, but the SPI lock the caller holds
+    // serialises the usual competitors and it is strictly better than letting reserve() be the first to find
+    // out. On ESP32 do NOT replace this with heap_caps_get_largest_free_block(): it walks every TLSF block of
+    // every matching heap while holding the allocator lock, and on PSRAM boards that walk blocks wifi_malloc()
+    // on the other core long enough to trip the interrupt watchdog (#11666).
+    while (reservedCount > 0) {
+        void *probe = malloc(reservedCount * sizeof(meshtastic_FileInfo));
+        if (probe) {
+            // Observable access so LTO cannot elide the malloc()/free() pair and turn the probe
+            // into a compile-time yes.
+            *static_cast<volatile char *>(probe) = 0;
+            free(probe);
+            break;
+        }
+        reservedCount /= 2;
+    }
+    if (reservedCount == 0) {
+        if (wasLimited)
+            *wasLimited = true;
+        return filenames;
+    }
+    if (reservedCount < maxCount) {
+        if (wasLimited)
+            *wasLimited = true;
+        maxCount = reservedCount;
+    }
+    filenames.reserve(reservedCount);
+    collectFiles(dirname, levels, maxCount, filenames, wasLimited);
+#endif
+    return filenames;
+}
+
+/**
+ * Lists the contents of a directory.
+ * We can't use SPILOCK here because of recursion. Callers of this function should use SPILOCK.
+ *
+ * @param dirname The name of the directory to list.
+ * @param levels The number of levels of subdirectories to list.
+ * @param del Whether or not to delete the contents of the directory after listing.
+ */
+void listDir(const char *dirname, uint8_t levels, bool del)
+{
+#ifdef FSCom
+    char buffer[255];
+    File root = FSCom.open(dirname, FILE_O_READ);
+    if (!root || !root.isDirectory())
+        return;
+
+    File file = root.openNextFile();
+    while (file && file.name()[0]) { // file.name()[0] check: workaround for Adafruit LittleFS nRF52 bug #4395
+#ifdef ARCH_ESP32
+        const char *filepath = file.path();
+#else
+        const char *filepath = file.name();
+#endif
+        if (file.isDirectory() && !String(file.name()).endsWith(".")) {
+            if (levels) {
+                listDir(filepath, levels - 1, del);
+                if (del) {
+                    LOG_DEBUG("Remove %s", filepath);
+                    strncpy(buffer, filepath, sizeof(buffer) - 1);
+                    buffer[sizeof(buffer) - 1] = '\0';
+                    file.close();
+                    FSCom.rmdir(buffer);
+                } else {
+                    file.close();
+                }
+            }
+        } else {
+            if (del) {
+                LOG_DEBUG("Delete %s", filepath);
+                strncpy(buffer, filepath, sizeof(buffer) - 1);
+                buffer[sizeof(buffer) - 1] = '\0';
+                file.close();
+                FSCom.remove(buffer);
+            } else {
+                LOG_TRACE(" %s (%i Bytes)", filepath, file.size());
+                file.close();
+            }
+        }
+        file = root.openNextFile();
+    }
+#ifdef ARCH_ESP32
+    const char *rootpath = root.path();
+#else
+    const char *rootpath = root.name();
+#endif
+    if (del) {
+        LOG_DEBUG("Remove %s", rootpath);
+        strncpy(buffer, rootpath, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        root.close();
+        FSCom.rmdir(buffer);
+    } else {
+        root.close();
+    }
+#endif
+}
+
+/**
+ * @brief Removes a directory and all its contents.
+ *
+ * This function recursively removes a directory and all its contents, including subdirectories and files.
+ *
+ * @param dirname The name of the directory to remove.
+ */
+void rmDir(const char *dirname)
+{
+#ifdef FSCom
+    listDir(dirname, 10, true);
+#endif
+}
+
+/**
+ * Some platforms (nrf52) might need to do an extra step before FSBegin().
+ */
+__attribute__((weak, noinline)) void preFSBegin() {}
+
+void fsInit()
+{
+#ifdef FSCom
+    concurrency::LockGuard g(spiLock);
+    preFSBegin();
+    if (!FSBegin()) {
+        LOG_ERROR("Filesystem mount failed");
+        // assert(0); This auto-formats the partition, so no need to fail here.
+    }
+#if defined(ARCH_ESP32)
+    LOG_DEBUG("Filesystem files (%d/%d Bytes):", FSCom.usedBytes(), FSCom.totalBytes());
+#else
+    LOG_TRACE("Filesystem files:");
+#endif
+    listDir("/", 10);
+#endif
+}
+
+/**
+ * Initializes the SD card and mounts the file system.
+ */
+void setupSDCard()
+{
+#if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI) && !defined(HAS_SD_MMC)
+    concurrency::LockGuard g(spiLock);
+    SDHandler.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+    if (!SD.begin(SDCARD_CS, SDHandler, SD_SPI_FREQUENCY)) {
+        LOG_DEBUG("No SD_MMC card detected");
+        return;
+    }
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        LOG_DEBUG("No SD_MMC card attached");
+        return;
+    }
+    LOG_DEBUG("SD_MMC Card Type: ");
+    if (cardType == CARD_MMC) {
+        LOG_DEBUG("MMC");
+    } else if (cardType == CARD_SD) {
+        LOG_DEBUG("SDSC");
+    } else if (cardType == CARD_SDHC) {
+        LOG_DEBUG("SDHC");
+    } else {
+        LOG_DEBUG("UNKNOWN");
+    }
+
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    LOG_DEBUG("SD Card Size: %lu MB", (uint32_t)cardSize);
+    LOG_DEBUG("Total space: %lu MB", (uint32_t)(SD.totalBytes() / (1024 * 1024)));
+    LOG_DEBUG("Used space: %lu MB", (uint32_t)(SD.usedBytes() / (1024 * 1024)));
+#endif
+}

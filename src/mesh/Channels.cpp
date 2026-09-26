@@ -1,0 +1,621 @@
+#include "Channels.h"
+
+#include "CryptoEngine.h"
+#include "Default.h"
+#include "DisplayFormatters.h"
+#include "NodeDB.h"
+#include "RadioInterface.h"
+#include "configuration.h"
+
+#include <assert.h>
+
+#if !MESHTASTIC_EXCLUDE_MQTT
+#include "mqtt/MQTT.h"
+#endif
+
+Channels channels;
+
+const char *Channels::adminChannel = "admin";
+const char *Channels::gpioChannel = "gpio";
+const char *Channels::serialChannel = "serial";
+#if !MESHTASTIC_EXCLUDE_MQTT
+const char *Channels::mqttChannel = "mqtt";
+#endif
+
+meshtastic_Channel dummyChannel = {.index = -1};
+
+uint8_t xorHash(const uint8_t *p, size_t len)
+{
+    uint8_t code = 0;
+    for (size_t i = 0; i < len; i++)
+        code ^= p[i];
+    return code;
+}
+
+/** Given a channel number, return the (0 to 255) hash for that channel.
+ * The hash is just an xor of the channel name followed by the channel PSK being used for encryption
+ * If no suitable channel could be found, return -1
+ */
+int16_t Channels::generateHash(ChannelIndex channelNum)
+{
+    auto k = getKey(channelNum);
+    if (k.length < 0)
+        return -1; // invalid
+    else {
+        const char *name = getName(channelNum);
+        uint8_t h = xorHash((const uint8_t *)name, strlen(name));
+
+        h ^= xorHash(k.bytes, k.length);
+
+        // Differentiate AEAD channels in routing so AEAD and non-AEAD
+        // channels with the same PSK have different hashes
+        auto &ch = getByIndex(channelNum);
+        if (ch.has_settings && ch.settings.use_aead)
+            h ^= 0xAE;
+
+        return h;
+    }
+}
+
+/**
+ * Validate a channel, fixing any errors as needed
+ */
+meshtastic_Channel &Channels::fixupChannel(ChannelIndex chIndex)
+{
+    meshtastic_Channel &ch = getByIndex(chIndex);
+
+    ch.index = chIndex; // Preinit the index so it be ready to share with the phone (we'll never change it later)
+
+    if (!ch.has_settings) {
+        // No settings! Must disable and skip
+        ch.role = meshtastic_Channel_Role_DISABLED;
+        memset(&ch.settings, 0, sizeof(ch.settings));
+        ch.has_settings = true;
+    } else {
+        meshtastic_ChannelSettings &meshtastic_channelSettings = ch.settings;
+
+        // Convert the old string "Default" to our new short representation
+        if (strcmp(meshtastic_channelSettings.name, "Default") == 0)
+            *meshtastic_channelSettings.name = '\0';
+
+        // AEAD needs key material. Left set on a channel that resolves to no PSK it would make every
+        // send fail with BAD_REQUEST and every receive drop, with nothing in the config to show why.
+        if (meshtastic_channelSettings.use_aead && getKey(chIndex).length <= 0) {
+            LOG_WARN("Channel %d has AEAD enabled but no PSK; clearing use_aead", chIndex);
+            meshtastic_channelSettings.use_aead = false;
+        }
+    }
+
+    hashes[chIndex] = generateHash(chIndex);
+
+    return ch;
+}
+
+void Channels::initDefaultLoraConfig()
+{
+    meshtastic_Config_LoRaConfig &loraConfig = config.lora;
+
+    loraConfig.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST; // Default to Long Range & Fast
+    loraConfig.use_preset = true;
+    loraConfig.tx_power = 0; // default
+    loraConfig.channel_num = 0;
+
+#ifdef USERPREFS_LORACONFIG_TX_POWER
+    loraConfig.tx_power = USERPREFS_LORACONFIG_TX_POWER;
+#endif
+#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
+    loraConfig.modem_preset = USERPREFS_LORACONFIG_MODEM_PRESET;
+#endif
+#ifdef USERPREFS_LORACONFIG_CHANNEL_NUM
+    loraConfig.channel_num = USERPREFS_LORACONFIG_CHANNEL_NUM;
+#endif
+
+    // Apply any hardcoded USERPREFS overrides for custom modem config (e.g. region-locked boards)
+#ifdef USERPREFS_LORACONFIG_USE_PRESET
+    loraConfig.use_preset = USERPREFS_LORACONFIG_USE_PRESET;
+#endif
+#ifdef USERPREFS_LORACONFIG_BANDWIDTH
+    loraConfig.bandwidth = USERPREFS_LORACONFIG_BANDWIDTH;
+#endif
+#ifdef USERPREFS_LORACONFIG_SPREAD_FACTOR
+    loraConfig.spread_factor = USERPREFS_LORACONFIG_SPREAD_FACTOR;
+#endif
+#ifdef USERPREFS_LORACONFIG_CODING_RATE
+    loraConfig.coding_rate = USERPREFS_LORACONFIG_CODING_RATE;
+#endif
+#ifdef USERPREFS_LORACONFIG_OVERRIDE_FREQUENCY
+    loraConfig.override_frequency = USERPREFS_LORACONFIG_OVERRIDE_FREQUENCY;
+#endif
+}
+
+bool Channels::ensureLicensedOperation()
+{
+    if (!owner.is_licensed) {
+        return false;
+    }
+    bool hasEncryptionOrAdmin = false;
+    for (uint8_t i = 0; i < MAX_NUM_CHANNELS; i++) {
+        auto channel = channels.getByIndex(i);
+        if (!channel.has_settings) {
+            continue;
+        }
+        auto &channelSettings = channel.settings;
+        if (strcasecmp(channelSettings.name, Channels::adminChannel) == 0) {
+            if (channel.role != meshtastic_Channel_Role_DISABLED || channelSettings.psk.size > 0) {
+                channel.role = meshtastic_Channel_Role_DISABLED;
+                channelSettings.psk.bytes[0] = 0;
+                channelSettings.psk.size = 0;
+                hasEncryptionOrAdmin = true;
+                channels.setChannel(channel);
+            }
+
+        } else if (channelSettings.psk.size > 0) {
+            channelSettings.psk.bytes[0] = 0;
+            channelSettings.psk.size = 0;
+            hasEncryptionOrAdmin = true;
+            channels.setChannel(channel);
+        }
+    }
+    return hasEncryptionOrAdmin;
+}
+
+/**
+ * Write a default channel to the specified channel index
+ */
+void Channels::initDefaultChannel(ChannelIndex chIndex)
+{
+    meshtastic_Channel &ch = getByIndex(chIndex);
+    meshtastic_ChannelSettings &channelSettings = ch.settings;
+
+    uint8_t defaultpskIndex = 1;
+    channelSettings.psk.bytes[0] = defaultpskIndex;
+    channelSettings.psk.size = 1;
+    strncpy(channelSettings.name, "", sizeof(channelSettings.name));
+    // Position sharing is OPT-IN: precision 0 means "do not broadcast location". A user (or the phone app)
+    // must explicitly raise precision to start sharing. See the one-time opt-in migration in NodeDB.cpp.
+    channelSettings.module_settings.position_precision = 0;
+    channelSettings.has_module_settings = true;
+
+    ch.has_settings = true;
+    ch.role = chIndex == 0 ? meshtastic_Channel_Role_PRIMARY : meshtastic_Channel_Role_SECONDARY;
+
+    static_assert(MAX_NUM_CHANNELS == 8, "the userPrefs switch below covers indices 0-7");
+
+// bin/platformio-custom.py completes every field of an index the vendor configured, so no field is
+// individually optional here and a new index costs one case rather than eighteen lines.
+#define USERPREFS_APPLY_CHANNEL(n)                                                                                               \
+    do {                                                                                                                         \
+        static const uint8_t userprefsPsk[] = USERPREFS_CHANNEL_##n##_PSK;                                                       \
+        static_assert(sizeof(userprefsPsk) <= sizeof(channelSettings.psk.bytes),                                                 \
+                      "USERPREFS_CHANNEL_" #n "_PSK is wider than psk.bytes");                                                   \
+        memcpy(channelSettings.psk.bytes, userprefsPsk, sizeof(userprefsPsk));                                                   \
+        channelSettings.psk.size = sizeof(userprefsPsk);                                                                         \
+        strncpy(channelSettings.name, (const char *)USERPREFS_CHANNEL_##n##_NAME, sizeof(channelSettings.name) - 1);             \
+        channelSettings.module_settings.position_precision = USERPREFS_CHANNEL_##n##_PRECISION;                                  \
+        channelSettings.module_settings.is_muted = USERPREFS_CHANNEL_##n##_IS_MUTED;                                             \
+        channelSettings.uplink_enabled = USERPREFS_CHANNEL_##n##_UPLINK_ENABLED;                                                 \
+        channelSettings.downlink_enabled = USERPREFS_CHANNEL_##n##_DOWNLINK_ENABLED;                                             \
+    } while (0)
+
+    switch (chIndex) {
+#ifdef USERPREFS_CHANNEL_0_PSK
+    case 0:
+        USERPREFS_APPLY_CHANNEL(0);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_1_PSK
+    case 1:
+        USERPREFS_APPLY_CHANNEL(1);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_2_PSK
+    case 2:
+        USERPREFS_APPLY_CHANNEL(2);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_3_PSK
+    case 3:
+        USERPREFS_APPLY_CHANNEL(3);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_4_PSK
+    case 4:
+        USERPREFS_APPLY_CHANNEL(4);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_5_PSK
+    case 5:
+        USERPREFS_APPLY_CHANNEL(5);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_6_PSK
+    case 6:
+        USERPREFS_APPLY_CHANNEL(6);
+        break;
+#endif
+#ifdef USERPREFS_CHANNEL_7_PSK
+    case 7:
+        USERPREFS_APPLY_CHANNEL(7);
+        break;
+#endif
+    default:
+        break;
+    }
+
+#undef USERPREFS_APPLY_CHANNEL
+}
+
+CryptoKey Channels::getKey(ChannelIndex chIndex)
+{
+    meshtastic_Channel &ch = getByIndex(chIndex);
+    const meshtastic_ChannelSettings &channelSettings = ch.settings;
+
+    CryptoKey k;
+    memset(k.bytes, 0, sizeof(k.bytes)); // In case the user provided a short key, we want to pad the rest with zeros
+
+    if (!ch.has_settings || ch.role == meshtastic_Channel_Role_DISABLED) {
+        k.length = -1; // invalid
+    } else {
+        memcpy(k.bytes, channelSettings.psk.bytes, channelSettings.psk.size);
+        k.length = channelSettings.psk.size;
+        if (k.length == 0) {
+            // A secondary with no PSK borrows the primary's key; the chIndex != primaryIndex check
+            // prevents infinite recursion if the primary slot itself is marked SECONDARY
+            if (ch.role == meshtastic_Channel_Role_SECONDARY && chIndex != primaryIndex) {
+                LOG_DEBUG("Unset PSK for secondary channel %s. use primary key", ch.settings.name);
+                k = getKey(primaryIndex);
+            } else {
+                LOG_WARN("User disabled encryption");
+            }
+        } else if (k.length == 1) {
+            // Convert the short single byte variants of psk into variant that can be used more generally
+
+            uint8_t pskIndex = k.bytes[0];
+            LOG_DEBUG("Expand short PSK #%d", pskIndex);
+            if (pskIndex == 0)
+                k.length = 0; // Turn off encryption
+            else {
+                memcpy(k.bytes, defaultpsk, sizeof(defaultpsk));
+                k.length = sizeof(defaultpsk);
+                // Bump up the last byte of PSK as needed
+                uint8_t *last = k.bytes + sizeof(defaultpsk) - 1;
+                *last = *last + pskIndex - 1; // index of 1 means no change vs defaultPSK
+            }
+        } else if (k.length < 16) {
+            // Error! The user specified only the first few bits of an AES128 key.  So by convention we just pad the rest of the
+            // key with zeros
+            LOG_WARN("User provided a too short AES128 key - padding");
+            k.length = 16;
+        } else if (k.length < 32 && k.length != 16) {
+            // Error! The user specified only the first few bits of an AES256 key.  So by convention we just pad the rest of the
+            // key with zeros
+            LOG_WARN("User provided a too short AES256 key - padding");
+            k.length = 32;
+        }
+    }
+
+    return k;
+}
+
+/** Given a channel index, change to use the crypto key specified by that index
+ */
+int16_t Channels::setCrypto(ChannelIndex chIndex)
+{
+    CryptoKey k = getKey(chIndex);
+
+    if (k.length < 0)
+        return -1;
+    else {
+        // Tell our crypto engine about the psk
+        crypto->setKey(k);
+        return getHash(chIndex);
+    }
+}
+
+void Channels::initDefaults()
+{
+    channelFile.channels_count = MAX_NUM_CHANNELS;
+    for (int i = 0; i < channelFile.channels_count; i++)
+        fixupChannel(i);
+    initDefaultLoraConfig();
+
+#ifdef USERPREFS_CHANNELS_TO_WRITE
+    for (int i = 0; i < USERPREFS_CHANNELS_TO_WRITE; i++) {
+        initDefaultChannel(i);
+    }
+#else
+    initDefaultChannel(0);
+#endif
+}
+
+void Channels::onConfigChanged()
+{
+    // Make sure the phone hasn't mucked anything up. Settle the primary first: fixupChannel()
+    // hashes through getKey(), which follows a keyless secondary to primaryIndex.
+    bool hasPrimary = false;
+    for (int i = 0; i < channelFile.channels_count; i++) {
+        const meshtastic_Channel &ch = getByIndex(i);
+
+        if (ch.has_settings && ch.role == meshtastic_Channel_Role_PRIMARY) {
+            primaryIndex = i;
+            hasPrimary = true;
+        }
+    }
+
+    for (int i = 0; i < channelFile.channels_count; i++)
+        fixupChannel(i);
+
+    // Enforce the invariant that primaryIndex references a PRIMARY channel: a malformed config can
+    // demote every slot, which would leave all getPrimaryIndex() readers on a stale non-primary slot
+    if (!hasPrimary) {
+        meshtastic_Channel &stale = getByIndex(primaryIndex);
+        if (stale.role == meshtastic_Channel_Role_SECONDARY) {
+            stale.role = meshtastic_Channel_Role_PRIMARY; // keep the slot's key material
+        } else {
+            // Promoting a DISABLED (zeroed) slot would make a plaintext primary; restore the default
+            primaryIndex = 0;
+            initDefaultChannel(0);
+        }
+        LOG_WARN("Config has no PRIMARY channel, restored one at slot %u", primaryIndex);
+        // The key every keyless secondary resolves through just changed, so re-run the lot
+        for (int i = 0; i < channelFile.channels_count; i++)
+            fixupChannel(i);
+    }
+#if !MESHTASTIC_EXCLUDE_MQTT
+    if (channels.anyMqttEnabled() && mqtt && !mqtt->isEnabled()) {
+        LOG_DEBUG("MQTT is enabled on at least one channel, so set MQTT thread to run immediately");
+        mqtt->start();
+    }
+#endif
+}
+
+meshtastic_Channel &Channels::getByIndex(ChannelIndex chIndex)
+{
+    // remove this assert cause malformed packets can make our firmware reboot here.
+    if (chIndex < channelFile.channels_count) { // This should be equal to MAX_NUM_CHANNELS
+        meshtastic_Channel *ch = channelFile.channels + chIndex;
+        return *ch;
+    } else {
+        LOG_ERROR("Invalid channel index %d > %d, malformed packet received?", chIndex, channelFile.channels_count);
+        return dummyChannel;
+    }
+}
+
+meshtastic_Channel &Channels::getByName(const char *chName)
+{
+    for (ChannelIndex i = 0; i < getNumChannels(); i++) {
+        if (strcasecmp(getGlobalId(i), chName) == 0) {
+            return channelFile.channels[i];
+        }
+    }
+
+    return getByIndex(getPrimaryIndex());
+}
+
+void Channels::setChannel(const meshtastic_Channel &c)
+{
+    meshtastic_Channel &old = getByIndex(c.index);
+
+    // if this is the new primary, demote any existing roles
+    if (c.role == meshtastic_Channel_Role_PRIMARY)
+        for (int i = 0; i < getNumChannels(); i++)
+            if (channelFile.channels[i].role == meshtastic_Channel_Role_PRIMARY)
+                channelFile.channels[i].role = meshtastic_Channel_Role_SECONDARY;
+
+    old = c; // slam in the new settings/role
+}
+
+bool Channels::anyMqttEnabled()
+{
+#if USERPREFS_EVENT_MODE && !MESHTASTIC_EXCLUDE_MQTT
+    // Don't publish messages on the public MQTT broker if we are in event mode
+    if (mqtt && mqtt->isUsingDefaultServer() && mqtt->isUsingDefaultRootTopic()) {
+        return false;
+    }
+#endif
+    for (int i = 0; i < getNumChannels(); i++)
+        if (channelFile.channels[i].role != meshtastic_Channel_Role_DISABLED && channelFile.channels[i].has_settings &&
+            (channelFile.channels[i].settings.downlink_enabled || channelFile.channels[i].settings.uplink_enabled))
+            return true;
+
+    return false;
+}
+
+const char *Channels::getName(size_t chIndex)
+{
+    // Convert the short "" representation for Default into a usable string
+    const meshtastic_ChannelSettings &channelSettings = getByIndex(chIndex).settings;
+    const char *channelName = channelSettings.name;
+    if (!*channelName) { // emptystring
+        // Per mesh.proto spec, if bandwidth is specified we must ignore modemPreset enum, we assume that in that case
+        // the app effed up and forgot to set channelSettings.name
+        if (config.lora.use_preset) {
+            channelName = DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, config.lora.use_preset);
+        } else {
+            channelName = "Custom";
+        }
+    }
+
+    return channelName;
+}
+
+bool Channels::isDefaultChannel(ChannelIndex chIndex)
+{
+    const auto &ch = getByIndex(chIndex);
+    if (ch.settings.psk.size == 1 && ch.settings.psk.bytes[0] == 1) {
+        const char *name = getName(chIndex);
+        const char *presetName =
+            DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, config.lora.use_preset);
+        // Check if the name is the default derived from the modem preset
+        if (strcmp(name, presetName) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool cryptoKeyIsPublic(const CryptoKey &key)
+{
+    if (key.length == 0)
+        return true; // encryption disabled
+    // Match the defaultpsk family ignoring its last byte (getKey() bumps only that byte per 1-byte index).
+    if (key.length == (int)sizeof(defaultpsk) && memcmp(key.bytes, defaultpsk, sizeof(defaultpsk) - 1) == 0)
+        return true;
+    return false;
+}
+
+bool channelFileUsesPublicKey(const meshtastic_ChannelFile &cf, ChannelIndex chIndex)
+{
+    if (chIndex >= cf.channels_count)
+        return false;
+    const meshtastic_Channel &ch = cf.channels[chIndex];
+    if (!ch.has_settings || ch.role == meshtastic_Channel_Role_DISABLED)
+        return false;
+
+    const auto &psk = ch.settings.psk;
+    if (psk.size == 0) {
+        // Secondary channels inherit the primary key when unset; primary size==0 means encryption disabled.
+        if (ch.role == meshtastic_Channel_Role_SECONDARY) {
+            // Resolve against the PRIMARY channel's key. The singleton's primaryIndex isn't available in
+            // the raw-struct path (this runs during boot migration before initDefaults), so scan by role.
+            // Fail closed to "public" if no distinct PRIMARY is found (malformed config).
+            for (pb_size_t p = 0; p < cf.channels_count; p++) {
+                if (cf.channels[p].role == meshtastic_Channel_Role_PRIMARY)
+                    return (p == chIndex) ? true : channelFileUsesPublicKey(cf, (ChannelIndex)p);
+            }
+            return true;
+        }
+        return true;
+    }
+
+    if (psk.size == 1) {
+        // Short PSK aliases: 0 disables encryption; 1..255 are the public defaultpsk family.
+        return true;
+    }
+
+    return (psk.size == sizeof(defaultpsk) && memcmp(psk.bytes, defaultpsk, sizeof(defaultpsk) - 1) == 0);
+}
+
+bool Channels::usesPublicKey(ChannelIndex chIndex)
+{
+    // Delegates to the pure, on-disk-struct variant so the two can't drift. getByIndex() reads the same
+    // global channelFile, so this is behavior-preserving for the position-precision clamp callers.
+    return channelFileUsesPublicKey(channelFile, chIndex);
+}
+
+bool Channels::isWellKnownChannel(ChannelIndex chIndex)
+{
+    const auto &ch = getByIndex(chIndex);
+    // Absent (unencrypted) or single-byte PSK - all the well-known key indexes
+    if (ch.settings.psk.size > 1)
+        return false;
+
+    const char *name = getName(chIndex);
+    for (int p = _meshtastic_Config_LoRaConfig_ModemPreset_MIN; p <= _meshtastic_Config_LoRaConfig_ModemPreset_MAX; p++) {
+        const char *presetName =
+            DisplayFormatters::getModemPresetDisplayName(static_cast<meshtastic_Config_LoRaConfig_ModemPreset>(p), false, true);
+        // Presets without a display name fall through to "Invalid" - never a match
+        if (strcmp(presetName, "Invalid") != 0 && strcmp(name, presetName) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool Channels::isEventChannel(ChannelIndex chIndex)
+{
+#if USERPREFS_BLOCK_POSITION_ON_EVENT_CHANNEL && defined(USERPREFS_CHANNEL_0_PSK)
+    static const uint8_t configuredEventPsk[] = USERPREFS_CHANNEL_0_PSK;
+    static_assert(sizeof(configuredEventPsk) == 16 || sizeof(configuredEventPsk) == 32,
+                  "USERPREFS_CHANNEL_0_PSK must be an AES-128 or AES-256 key");
+    CryptoKey effectiveKey = getKey(chIndex);
+    return effectiveKey.length == sizeof(configuredEventPsk) &&
+           memcmp(effectiveKey.bytes, configuredEventPsk, sizeof(configuredEventPsk)) == 0;
+#else
+    (void)chIndex;
+    return false;
+#endif
+}
+
+bool Channels::hasDefaultChannel()
+{
+    // If we don't use a preset or the default frequency slot, or we override the frequency, we don't have a default channel
+    if (!config.lora.use_preset || !RadioInterface::uses_default_frequency_slot || config.lora.override_frequency)
+        return false;
+    // Check if any of the channels are using the default name and PSK
+    for (size_t i = 0; i < getNumChannels(); i++) {
+        if (isDefaultChannel(i))
+            return true;
+    }
+    return false;
+}
+
+/** Given a channel hash setup crypto for decoding that channel (or the primary channel if that channel is unsecured)
+ *
+ * This method is called before decoding inbound packets
+ *
+ * @return false if the channel hash or channel is invalid
+ */
+bool Channels::decryptForHash(ChannelIndex chIndex, ChannelHash channelHash)
+{
+    if (chIndex >= getNumChannels() || getHash(chIndex) != channelHash) {
+        // LOG_DEBUG("Skip channel %d (hash %x) due to invalid hash/index, want=%x", chIndex, getHash(chIndex),
+        // channelHash);
+        return false;
+    } else {
+        LOG_DEBUG("Use channel %d (hash 0x%x)", chIndex, channelHash);
+        setCrypto(chIndex);
+        return true;
+    }
+}
+
+bool Channels::setDefaultPresetCryptoForHash(ChannelHash channelHash)
+{
+    // Iterate all known presets
+    for (int preset = _meshtastic_Config_LoRaConfig_ModemPreset_MIN; preset <= _meshtastic_Config_LoRaConfig_ModemPreset_MAX;
+         ++preset) {
+        const char *name = DisplayFormatters::getModemPresetDisplayName((meshtastic_Config_LoRaConfig_ModemPreset)preset, false,
+                                                                        config.lora.use_preset);
+        if (!name)
+            continue;
+        if (strcmp(name, "Invalid") == 0)
+            continue; // skip invalid placeholder
+        uint8_t h = xorHash((const uint8_t *)name, strlen(name));
+        // Expand default PSK alias 1 to actual bytes and xor into hash
+        uint8_t tmp = h ^ xorHash(defaultpsk, sizeof(defaultpsk));
+        if (tmp == channelHash) {
+            // Set crypto to defaultpsk and report success
+            CryptoKey k;
+            memcpy(k.bytes, defaultpsk, sizeof(defaultpsk));
+            k.length = sizeof(defaultpsk);
+            crypto->setKey(k);
+            LOG_INFO("Matched default preset '%s' for hash 0x%x; set default PSK", name, channelHash);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Channels::isAEADEnabled(ChannelIndex chIndex)
+{
+    auto &ch = getByIndex(chIndex);
+    return ch.has_settings && ch.settings.use_aead;
+}
+
+/** Given a channel index setup crypto for encoding that channel (or the primary channel if that channel is unsecured)
+ *
+ * This method is called before encoding outbound packets
+ *
+ * @return the (0 to 255) hash for that channel - if no suitable channel could be found, return -1
+ */
+int16_t Channels::setActiveByIndex(ChannelIndex channelIndex)
+{
+    return setCrypto(channelIndex);
+}
+
+bool isMutedForPacket(const meshtastic_MeshPacket &mp)
+{
+    if (!isBroadcast(mp.to) && isToUs(&mp))
+        return nodeInfoLiteIsMuted(nodeDB->getMeshNode(mp.from));
+
+    const meshtastic_Channel &ch = channels.getByIndex(mp.channel ? mp.channel : channels.getPrimaryIndex());
+    return ch.settings.has_module_settings && ch.settings.module_settings.is_muted;
+}

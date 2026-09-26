@@ -1,0 +1,32 @@
+#pragma once
+
+#include <OLEDDisplay.h>
+#include <OLEDDisplayUi.h>
+
+namespace graphics
+{
+
+/// Forward declarations
+class Screen;
+
+/**
+ * @brief Debug and diagnostic drawing functions
+ *
+ * Contains all functions related to drawing debug information,
+ * WiFi status, settings screens, and diagnostic data.
+ */
+namespace DebugRenderer
+{
+// WiFi status display
+void drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+
+// LoRa information display
+void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+
+// System screen display
+void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+// Chirpy screen display
+void drawChirpy(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+} // namespace DebugRenderer
+
+} // namespace graphics

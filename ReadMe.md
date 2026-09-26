@@ -1,30 +1,71 @@
-👻 GHOST OS v2.0 - The Next-Gen Portable Diagnostic Suite 👻
-Developed by: @pinoyunknown
-Source Repository: ://[github.com](https://github.com/PinoyUnknown/ghost-firmware)
+<div align="center" markdown="1">
 
-Break away from standard, static interfaces. Ghost OS transforms your M5Stack hardware into a high-performance, responsive diagnostic asset built entirely from the ground up using a multi-threaded architecture.
+<img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
+<h1>Ghost Firmware for Cardputer Mesh</h1>
 
-<img width="1408" height="768" alt="image_8f0e8dee" src="https://github.com/user-attachments/assets/76774e34-553c-47dd-9ea1-13755f03f403" />
+![GitHub release downloads](https://img.shields.io/github/downloads/meshtastic/firmware/total)
+[![CI](https://img.shields.io/github/actions/workflow/status/meshtastic/firmware/main_matrix.yml?branch=master&label=actions&logo=github&color=yellow)](https://github.com/meshtastic/firmware/actions/workflows/ci.yml)
+[![CLA assistant](https://cla-assistant.io/readme/badge/meshtastic/firmware)](https://cla-assistant.io/meshtastic/firmware)
+[![Fiscal Contributors](https://opencollective.com/meshtastic/tiers/badge.svg?label=Fiscal%20Contributors&color=deeppink)](https://opencollective.com/meshtastic/)
+[![Vercel](https://img.shields.io/static/v1?label=Powered%20by&message=Vercel&style=flat&logo=vercel&color=000000)](https://vercel.com?utm_source=meshtastic&utm_campaign=oss)
 
-⚡ KEY ADVANCEMENTS & CORE FEATURES:
+<a href="https://trendshift.io/repositories/5524" target="_blank"><img src="https://trendshift.io/api/badge/repositories/5524" alt="meshtastic%2Ffirmware | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
-• Dual-Core Resource Allocation: Intensive RF testing runs entirely isolated on Core 0, keeping your UI rendering at a locked 25+ FPS on Core 1 with zero execution stutter.
+</div>
 
-• Adaptive UI Scaling Layer: Dynamically reads your hardware panel properties at boot. The UI instantly formats itself perfectly whether you flash it to a Cardputer, Core2, or StickC Plus.
+</div>
 
-• Premium Futuristic Theme Engine: Instantly cycle between 5 animated, high-contrast layouts including Cyberpunk 2077, Hacker Matrix Cascade, and Tron Reaper.
+<div align="center">
+	<a href="https://meshtastic.org">Website</a>
+	-
+	<a href="https://meshtastic.org/docs/">Documentation</a>
+</div>
 
-• Pixel Art Boot Splash Screen: Tailored brand sequence featuring an optimized multi-color pixel grid asset.
+## Overview
 
-• Native System Power Telemetry: Integrated battery management stack streaming live precision percentage levels directly onto your header HUD.
+Ghost Firmware is a Cardputer Mesh build based on the upstream Meshtastic firmware. It preserves Meshtastic's LoRa mesh messaging and GPS support, and applies the Ghost splash screen plus the cyan/yellow/black palette from `Cyberpunk_2077_v1.0.0`.
 
+The upstream firmware and its licensing/attribution are retained. This project does not include Bruce's offensive Wi-Fi/RF attack functions.
 
-🎮 CONTROLS:
+The Wi-Fi survey reports broadcast SSID, BSSID/MAC, channel, RSSI, and security mode. It cannot reveal a nearby network's password or private IP address; Network Info reports this device's IP and gateway only while connected.
 
-• Press any key (Cardputer) or Tap the hardware wake button / Touch Screen (Core2 / StickC Plus) to dynamically shift colors and cycle background diagnostics loops.
+Developer links:
 
+- [PinoyUnknown](https://github.com/PinoyUnknown/)
+- [unidentifiedcyberghost](https://github.com/unidentifiedcyberghost)
+- [M5Burner developer page](https://burner.m5stack.com/developers/2102783541171187713)
 
+Meshtastic enables text messaging, location sharing, and telemetry over a decentralized mesh network, making it ideal for outdoor adventures, emergency preparedness, and remote operations.
 
+### Build the Cardputer Mesh image
 
-<img width="1408" height="768" alt="image_68002406" src="https://github.com/user-attachments/assets/49710ee5-7693-4bb8-bb4a-703b174103ab" />
+Install PlatformIO, then run this from the repository root:
 
+```sh
+pio run -e m5stack-cardputer-adv
+```
+
+The build workflow publishes the firmware as `Ghost-Firmware.bin`. For local builds, the board image is in `.pio/build/m5stack-cardputer-adv/`; use the board's Meshtastic-compatible flashing workflow and keep a copy of the original firmware before flashing.
+
+### Experimental generic M5Stack profiles
+
+The project also includes the requested generic Arduino configuration profiles:
+
+```sh
+pio run -e m5stack-cardputer
+pio run -e m5stack-core2
+pio run -e m5stick-cplus
+```
+
+These profiles pin M5GFX and M5Unified to `0.1.17`. They are configuration-only starting points and are not validated Ghost or Meshtastic firmware targets: this repository does not yet include their Meshtastic board definitions or hardware implementations. In particular, the generic Cardputer profile does not support the Mesh Kit's SX1262 LoRa radio and GPS. For the Cardputer Mesh Kit, build `m5stack-cardputer-adv`.
+
+### Get Started
+
+- 🔧 **[Building Instructions](https://meshtastic.org/docs/development/firmware/build)** - Learn how to compile the firmware from source.
+- ⚡ **[Flashing Instructions](https://meshtastic.org/docs/getting-started/flashing-firmware/)** - Install or update the firmware on your device.
+
+Join our community and help improve Meshtastic! 🚀
+
+## Stats
+
+![Alt](https://repobeats.axiom.co/api/embed/8025e56c482ec63541593cc5bd322c19d5c0bdcf.svg "Repobeats analytics image")

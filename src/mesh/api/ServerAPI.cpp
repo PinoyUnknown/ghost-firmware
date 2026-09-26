@@ -1,0 +1,165 @@
+// First, in its own block so the include sorter keeps it there: configuration.h supplies the
+// variant defines mesh-pb-constants.h needs (portduino resolves MAX_NUM_NODES at runtime).
+#include "configuration.h"
+
+#include "ServerAPI.h"
+#include "Throttle.h"
+#include "concurrency/LockGuard.h"
+#include <Arduino.h>
+#include <cstdlib>
+#include <new>
+
+static constexpr uint32_t TCP_IDLE_TIMEOUT_MS = 15 * 60 * 1000UL;
+
+template <typename T>
+ServerAPI<T>::ServerAPI(T &_client) : StreamAPI(&client), concurrency::OSThread("ServerAPI"), client(_client)
+{
+    LOG_INFO("Incoming API connection");
+}
+
+template <typename T> ServerAPI<T>::~ServerAPI()
+{
+    client.stop();
+}
+
+template <typename T> void ServerAPI<T>::close()
+{
+    client.stop(); // drop tcp connection
+    StreamAPI::close();
+}
+
+/// Check the current underlying physical link to see if the client is currently
+/// connected
+template <typename T> bool ServerAPI<T>::checkIsConnected()
+{
+    return client.connected();
+}
+
+/// Frame TCP output, retaining any tail the socket could not take yet.
+template <typename T> bool ServerAPI<T>::writeFrame(uint8_t *buf, size_t len, bool bestEffort)
+{
+    if (len == 0 || !canWrite)
+        return false;
+
+    const size_t totalLen = buildFrameHeader(buf, len);
+
+    concurrency::LockGuard guard(&streamLock);
+    // Only a dropped link is a reason to refuse a write. A short write means the transmit buffer
+    // is momentarily full, so retain the tail and finish it on a later pass instead of tearing
+    // down the session mid-NodeDB-dump.
+    if (!client.connected()) {
+        canWrite = false;
+        enabled = false;
+        LOG_WARN("TCP client disconnected before write, closing API service");
+        close();
+        return false;
+    }
+
+    return frameWriter.writeFrame(client, buf, totalLen, bestEffort);
+}
+
+/// Continue retained TCP output under the shared stream lock.
+template <typename T> bool ServerAPI<T>::finishPendingFrame()
+{
+    concurrency::LockGuard guard(&streamLock);
+    return frameWriter.finishPendingFrame(client);
+}
+
+/// Report a retained TCP frame awaiting transmit space.
+template <typename T> bool ServerAPI<T>::hasRetainedFrame()
+{
+    concurrency::LockGuard guard(&streamLock);
+    return !frameWriter.isIdle();
+}
+
+/// Protect the retained log buffer from being re-encoded under it.
+template <typename T> bool ServerAPI<T>::canEncodeLogRecord()
+{
+    return !hasRetainedFrame();
+}
+
+template <class T> int32_t ServerAPI<T>::runOnce()
+{
+    if (client.connected()) {
+        if (lastContactMsec > 0 && !Throttle::isWithinTimespanMs(lastContactMsec, TCP_IDLE_TIMEOUT_MS)) {
+            LOG_WARN("TCP connection timeout, no data for %lu ms", (unsigned long)(millis() - lastContactMsec));
+            close();
+            enabled = false;
+            return 0;
+        }
+        int32_t delay = StreamAPI::runOncePart();
+        // Nothing wakes us when the socket frees transmit space.
+        return hasPendingOutput() && delay > 25 ? 25 : delay;
+    } else {
+        LOG_INFO("Client dropped connection, suspend API service");
+        close();
+        enabled = false; // we no longer need to run
+        return 0;
+    }
+}
+
+template <class T, class U> APIServerPort<T, U>::APIServerPort(int port) : U(port), concurrency::OSThread("ApiServer") {}
+
+template <class T, class U> void APIServerPort<T, U>::init()
+{
+    U::begin();
+}
+
+template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
+{
+    // Clean up previous connection if its client already disconnected
+    if (openAPI && !openAPI->checkIsConnected()) {
+        openAPI.reset();
+    }
+
+#ifdef ARCH_ESP32
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    auto client = U::accept();
+#else
+    auto client = U::available();
+#endif
+#elif defined(ARCH_RP2040) || defined(ARCH_NRF52)
+    auto client = U::accept();
+#else
+    auto client = U::available();
+#endif
+    if (client) {
+        // Close any previous connection (see FIXME in header file)
+        if (openAPI) {
+#if RAK_4631
+            // RAK13800 Ethernet requests periodically take more time
+            // This backoff addresses most cases keeping max wait < 1s
+            // Reconnections are delayed by full wait time
+            if (waitTime < 400) {
+                waitTime *= 2;
+                LOG_INFO("Previous TCP connection still open, try again in %dms", waitTime);
+                return waitTime;
+            }
+#endif
+            LOG_INFO("Force close previous TCP connection");
+            openAPI.reset();
+        }
+
+        // A ServerAPI carries the stream rx/tx buffers plus the FromRadio/ToRadio scratch, several
+        // KB in one block. On ESP32 a new that cannot get that block is a reboot (see the note on
+        // openAPI in the header), and std::nothrow does not help there because libstdc++ builds it
+        // on the throwing form. malloc() does return nullptr, so take the block from malloc() and
+        // construct in place; if there is no room drop this connection instead of the node - the
+        // client retries and the next accept gets a fresh look at the heap. The T constructors do
+        // not allocate (default-constructed containers, fixed-size thread table), so nothing inside
+        // the placement new can throw either.
+        void *block = malloc(sizeof(T));
+        if (!block) {
+            LOG_ERROR("No heap for API connection (%u bytes), dropping client", (unsigned)sizeof(T));
+            client.stop();
+        } else {
+            openAPI.reset(new (block) T(client));
+        }
+        // cppcheck-suppress memleak ; block is owned by openAPI via placement new, freed by MallocDeleter
+    }
+
+#if RAK_4631
+    waitTime = 100;
+#endif
+    return 100; // only check occasionally for incoming connections
+}

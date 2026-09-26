@@ -1,0 +1,110 @@
+#pragma once
+
+#include <OLEDDisplay.h>
+#include <stdint.h>
+#include <string>
+
+namespace graphics
+{
+
+// =======================
+// Shared UI Helpers
+// =======================
+
+#define textZeroLine 0
+// Consistent Line Spacing - this is standard for all display and the fall-back spacing
+#define textFirstLine (FONT_HEIGHT_SMALL - 1)
+#define textSecondLine (textFirstLine + (FONT_HEIGHT_SMALL - 5))
+#define textThirdLine (textSecondLine + (FONT_HEIGHT_SMALL - 5))
+#define textFourthLine (textThirdLine + (FONT_HEIGHT_SMALL - 5))
+#define textFifthLine (textFourthLine + (FONT_HEIGHT_SMALL - 5))
+#define textSixthLine (textFifthLine + (FONT_HEIGHT_SMALL - 5))
+
+// Consistent Line Spacing for devices like T114 and TEcho/ThinkNode M1 of devices
+#define textFirstLine_medium (FONT_HEIGHT_SMALL + 1 + BASEUI_HEADER_MARGIN)
+#define textSecondLine_medium (textFirstLine_medium + FONT_HEIGHT_SMALL)
+#define textThirdLine_medium (textSecondLine_medium + FONT_HEIGHT_SMALL)
+#define textFourthLine_medium (textThirdLine_medium + FONT_HEIGHT_SMALL)
+#define textFifthLine_medium (textFourthLine_medium + FONT_HEIGHT_SMALL)
+#define textSixthLine_medium (textFifthLine_medium + FONT_HEIGHT_SMALL)
+
+// Consistent Line Spacing for devices like VisionMaster T190
+#define textFirstLine_large (FONT_HEIGHT_SMALL + 1)
+#define textSecondLine_large (textFirstLine_large + (FONT_HEIGHT_SMALL + 5))
+#define textThirdLine_large (textSecondLine_large + (FONT_HEIGHT_SMALL + 5))
+#define textFourthLine_large (textThirdLine_large + (FONT_HEIGHT_SMALL + 5))
+#define textFifthLine_large (textFourthLine_large + (FONT_HEIGHT_SMALL + 5))
+#define textSixthLine_large (textFifthLine_large + (FONT_HEIGHT_SMALL + 5))
+
+#ifndef BASEUI_HEADER_MARGIN
+#define BASEUI_HEADER_MARGIN 0
+#endif
+#ifndef BASEUI_HEADER_LR_MARGIN
+#define BASEUI_HEADER_LR_MARGIN 0
+#endif
+#ifndef BASEUI_BODY_LR_MARGIN
+#define BASEUI_BODY_LR_MARGIN 0
+#endif
+#ifndef BASEUI_BELOW_HEADER_MARGIN
+#define BASEUI_BELOW_HEADER_MARGIN 0
+#endif
+#ifndef ROUNDED_SCREEN
+#define ROUNDED_SCREEN false
+#endif
+
+// Quick screen access
+#define SCREEN_WIDTH display->getWidth()
+#define SCREEN_HEIGHT display->getHeight()
+
+// Shared state (declare inside namespace)
+extern bool hasUnreadMessage;
+enum class ScreenResolution : uint8_t { UltraLow = 0, Low = 1, High = 2 };
+extern ScreenResolution currentResolution;
+ScreenResolution determineScreenResolution(int16_t screenheight, int16_t screenwidth);
+
+void decomposeTime(uint32_t rtc_sec, int &hour, int &minute, int &second);
+
+// Rounded highlight (used for inverted headers)
+void drawRoundedHighlight(OLEDDisplay *display, int16_t x, int16_t y, int16_t w, int16_t h, int16_t r);
+
+// Shared battery/time/mail header
+void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *titleStr = "", bool force_no_invert = false,
+                      bool show_date = false, bool transparent_background = false, bool use_title_color_override = false,
+                      uint16_t title_color_override = 0);
+
+// Shared battery/time/mail header
+void drawCommonFooter(OLEDDisplay *display, int16_t x, int16_t y);
+
+// Inline so non-compact boards fold this to a constant false at every call site, cost-free.
+static inline bool isCompactPanel(OLEDDisplay *display)
+{
+#if defined(OLED_COMPACT_UI)
+    // Covers both known compact panels (72x40 and 64x48).
+    return display->getWidth() <= 80 && display->getHeight() <= 48;
+#else
+    (void)display;
+    return false;
+#endif
+}
+
+const int *getTextPositions(OLEDDisplay *display);
+
+bool isAllowedPunctuation(char c);
+
+std::string sanitizeString(const std::string &input);
+
+static inline bool isAPIConnected(uint8_t state)
+{
+    static constexpr bool connectedStates[] = {
+        /* STATE_NONE    */ false,
+        /* STATE_BLE     */ true,
+        /* STATE_WIFI    */ true,
+        /* STATE_SERIAL  */ true,
+        /* STATE_PACKET  */ true,
+        /* STATE_HTTP    */ true,
+        /* STATE_ETH     */ true,
+    };
+    return state < sizeof(connectedStates) ? connectedStates[state] : false;
+}
+
+} // namespace graphics

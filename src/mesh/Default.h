@@ -1,0 +1,161 @@
+#pragma once
+#include <MeshRadio.h>
+#include <NodeDB.h>
+#include <RadioInterface.h>
+#include <cmath>
+#include <cstdint>
+#include <meshUtils.h>
+#include <type_traits>
+#define ONE_DAY 24 * 60 * 60
+#define ONE_MINUTE_MS 60 * 1000
+#define THIRTY_SECONDS_MS 30 * 1000
+#define TWO_SECONDS_MS 2 * 1000
+#define FIVE_SECONDS_MS 5 * 1000
+#define TEN_SECONDS_MS 10 * 1000
+#define MAX_INTERVAL INT32_MAX // FIXME: INT32_MAX to avoid overflow issues with Apple clients but should be UINT32_MAX
+
+#define min_default_telemetry_interval_secs IF_ROUTER(ONE_DAY / 2, 30 * 60)
+#define default_gps_update_interval IF_ROUTER(ONE_DAY, 2 * 60)
+#define default_telemetry_broadcast_interval_secs IF_ROUTER(ONE_DAY / 2, 60 * 60)
+#define default_broadcast_interval_secs IF_ROUTER(ONE_DAY / 2, 60 * 60)
+#define default_broadcast_smart_minimum_interval_secs 5 * 60
+// Floor for our own position broadcasts when stationary (unchanged beyond the broadcast
+// precision) or fixed_position: identical positions get deduped by traffic management anyway.
+// Held one hour above default_traffic_mgmt_position_min_interval_secs so this refresh clears
+// the receivers' dedup window instead of being dropped as a duplicate.
+#define default_position_stationary_broadcast_secs (6 * 60 * 60)
+#define min_default_broadcast_interval_secs IF_ROUTER(ONE_DAY / 2, 60 * 60)
+#define min_default_broadcast_smart_minimum_interval_secs 5 * 60
+#define default_wait_bluetooth_secs IF_ROUTER(1, 60)
+#define default_sds_secs IF_ROUTER(ONE_DAY, UINT32_MAX) // Default to forever super deep sleep
+#define default_ls_secs IF_ROUTER(ONE_DAY, 5 * 60)
+#define default_min_wake_secs 10
+#define default_screen_on_secs IF_ROUTER(1, 60 * 10)
+#define default_node_info_broadcast_secs 3 * 60 * 60
+#define default_neighbor_info_broadcast_secs 6 * 60 * 60
+#define default_mesh_beacon_min_broadcast_interval_secs 3600
+#define min_node_info_broadcast_secs 60 * 60 // No regular broadcasts of more than once an hour
+#define min_neighbor_info_broadcast_secs 4 * 60 * 60
+#define default_map_publish_interval_secs 60 * 60
+
+enum class TrafficType { POSITION, TELEMETRY };
+
+// Traffic management defaults
+#define default_traffic_mgmt_position_precision_bits 19 // ~90m grid cells (±45m)
+// Kept below default_position_stationary_broadcast_secs so a stationary node's periodic refresh
+// is not deduped away by its neighbours.
+#define default_traffic_mgmt_position_min_interval_secs (5 * 60 * 60) // 5 hours between identical positions
+// Role cap: tracker-role origins may refresh a duplicate position this often (vs the 5h default).
+#define default_traffic_mgmt_tracker_position_min_interval_secs (60 * 60) // 1 hour
+// Role cap: lost-and-found origins may refresh a duplicate position this often, so a lost
+// device updates frequently without flooding. (Quantised to the dedup tick: ~2 ticks.)
+// Unlike before, lost-and-found is NOT exempt from the relayed precision clamp.
+#define default_traffic_mgmt_lost_and_found_position_min_interval_secs (15 * 60) // 15 minutes
+
+// Hop scaling defaults
+#define default_hop_scaling_min_target_nodes 40          // walk threshold: first hop reaching this cumulative count
+#define default_hop_scaling_max_target_nodes 80          // generous extension ceiling (2 × min)
+#define default_hop_scaling_min_target_nodes_floor 5     // minimum allowed min_target_nodes
+#define default_hop_scaling_max_target_nodes_ceiling 512 // maximum allowed max_target_nodes
+
+// Congestion gate: hop scaling only applies while the channel is measurably busy. Engage sits below
+// AirTime::polite_channel_util_percent (25) so hops ease back before the polite gate withholds traffic.
+#define default_hop_scaling_congestion_engage_pct 20  // smoothed channel utilization that engages scaling
+#define default_hop_scaling_congestion_release_pct 12 // smoothed channel utilization that releases it
+#define default_hop_scaling_congestion_confirm_runs 3 // consecutive 5-min samples needed to flip either way
+// Above this the hop walk's one-hop extension is cut to its strictest setting: the radio is
+// already withholding metadata at the polite gate, so an extra relay is the wrong thing to spend.
+#define default_hop_scaling_congestion_strict_pct 25 // = AirTime::polite_channel_util_percent
+// Hop floor for the infrastructure roles Router.cpp already groups for zero-cost hops.
+#define default_hop_scaling_infrastructure_hop_floor 3
+
+#ifdef USERPREFS_RINGTONE_NAG_SECS
+#define default_ringtone_nag_secs USERPREFS_RINGTONE_NAG_SECS
+#else
+#define default_ringtone_nag_secs 15
+#endif
+#define default_network_ipv6_enabled false
+
+#define default_mqtt_address "mqtt.meshtastic.org"
+#define default_mqtt_username "meshdev"
+#define default_mqtt_password "large4cats"
+#define default_mqtt_root "msh"
+#define default_mqtt_encryption_enabled true
+#define default_mqtt_tls_enabled false
+
+#define IF_ROUTER(routerVal, normalVal)                                                                                          \
+    ((config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||                                                        \
+      config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE)                                                     \
+         ? (routerVal)                                                                                                           \
+         : (normalVal))
+
+class Default
+{
+#if USERPREFS_EVENT_MODE && defined(USERPREFS_EVENT_MODE_HOP_LIMIT)
+    static constexpr auto eventModeHopLimitSetting = USERPREFS_EVENT_MODE_HOP_LIMIT;
+#else
+    static constexpr auto eventModeHopLimitSetting = HOP_RELIABLE;
+#endif
+    using EventModeHopLimitType = typename std::remove_cv<decltype(eventModeHopLimitSetting)>::type;
+    static_assert(std::is_integral<EventModeHopLimitType>::value && !std::is_same<EventModeHopLimitType, bool>::value &&
+                      eventModeHopLimitSetting >= 0 && eventModeHopLimitSetting <= HOP_MAX,
+                  "USERPREFS_EVENT_MODE_HOP_LIMIT must be an integer between 0 and 7");
+
+  public:
+    static constexpr uint8_t eventModeHopLimit = static_cast<uint8_t>(eventModeHopLimitSetting);
+    static constexpr uint8_t eventModeRelayHopLimit = eventModeHopLimit > 0 ? eventModeHopLimit - 1 : 0;
+
+    static uint32_t getConfiguredOrDefaultMs(uint32_t configuredInterval);
+    static uint32_t getConfiguredOrDefaultMs(uint32_t configuredInterval, uint32_t defaultInterval);
+    static uint32_t getConfiguredOrDefault(uint32_t configured, uint32_t defaultValue);
+    // Note: numOnlineNodes uses uint32_t to match the public API and allow flexibility,
+    // even though internal node counts use uint16_t (max 65535 nodes)
+    static uint32_t getConfiguredOrDefaultMsScaled(uint32_t configured, uint32_t defaultValue, uint32_t numOnlineNodes);
+    static uint32_t getConfiguredOrDefaultMsScaled(uint32_t configured, uint32_t defaultValue, uint32_t numOnlineNodes,
+                                                   TrafficType type);
+    static uint8_t getConfiguredOrDefaultHopLimit(uint8_t configured);
+    static uint32_t getConfiguredOrMinimumValue(uint32_t configured, uint32_t minValue);
+
+  private:
+    // Note: Kept as uint32_t to match the public API parameter type
+    static float congestionScalingCoefficient(uint32_t numOnlineNodes)
+    {
+        if (numOnlineNodes <= 40) {
+            return 1.0;
+        } else {
+            // Resolve SF and BW from preset or manual config
+            // When use_preset is true, config.lora.spread_factor and bandwidth may be 0
+            // because applyModemConfig() sets them on RadioInterface, not on config.lora
+            float bwKHz;
+            uint8_t sf;
+            uint8_t cr;
+            if (config.lora.use_preset) {
+                modemPresetToParams(config.lora.modem_preset, false, bwKHz, sf, cr);
+            } else {
+                sf = config.lora.spread_factor;
+                bwKHz = bwCodeToKHz(config.lora.bandwidth);
+            }
+
+            // Guard against invalid values
+            sf = clampSpreadFactor(sf);
+            bwKHz = clampBandwidthKHz(bwKHz);
+
+            // throttlingFactor = 2^SF / (BW_in_kHz * scaling_divisor)
+            // With scaling_divisor=100:
+            // In SF11 and BW=250khz (longfast), this gives 0.08192 rather than the original 0.075
+            // In SF10 and BW=250khz (mediumslow), this gives 0.04096 rather than the original 0.04
+            // In SF9 and BW=250khz (mediumfast), this gives 0.02048 rather than the original 0.02
+            // In SF7 and BW=250khz (shortfast), this gives 0.00512 rather than the original 0.01
+            float throttlingFactor = static_cast<float>(pow_of_2(sf)) / (bwKHz * 100.0f);
+
+#if USERPREFS_EVENT_MODE
+            // If we are in event mode, scale down the throttling factor by 4
+            throttlingFactor = static_cast<float>(pow_of_2(sf)) / (bwKHz * 25.0f);
+#endif
+
+            // Scaling up traffic based on number of nodes over 40
+            int nodesOverForty = (numOnlineNodes - 40);
+            return 1.0 + (nodesOverForty * throttlingFactor); // Each number of online node scales by throttle factor
+        }
+    }
+};

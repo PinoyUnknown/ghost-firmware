@@ -1,0 +1,80 @@
+// Deliberately does NOT include TestUtil.h. This suite is pure-function - no NodeDB, no router, no
+// sockets, no PKC - so the harness-wide guards there (no listening sockets, force_simradio clear)
+// would assert conditions it cannot reach, and initializeTestEnvironment()'s RTC and OSThread setup
+// would add portduino globals it otherwise never touches. Suite-level state cleanliness is still
+// checked from outside by bin/pio-test-isolate.sh, which wraps every suite regardless.
+#include "test_helpers.h"
+#include <Arduino.h>
+#include <unity.h>
+
+// Forward declarations for test functions
+void test_text_message_serialization();
+void test_text_message_serialization_null();
+void test_text_message_serialization_long_text();
+void test_text_message_serialization_oversized();
+void test_text_message_serialization_invalid_utf8();
+void test_position_serialization();
+void test_nodeinfo_serialization();
+void test_waypoint_serialization();
+void test_telemetry_device_metrics_serialization();
+void test_telemetry_environment_metrics_serialization();
+void test_telemetry_environment_metrics_comprehensive();
+void test_telemetry_environment_metrics_missing_fields();
+void test_telemetry_environment_metrics_complete_coverage();
+void test_telemetry_environment_metrics_unset_fields();
+void test_encrypted_packet_serialization();
+void test_empty_encrypted_packet();
+void test_timestamp_present_when_has_rx_time();
+void test_timestamp_zeroed_when_rx_time_absent();
+void test_encrypted_timestamp_zeroed_when_rx_time_absent();
+
+// Required by Unity: PlatformIO's weak defaults do not link on MinGW (PE-COFF weak externals).
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup()
+{
+    UNITY_BEGIN();
+
+    // Text message tests
+    RUN_TEST(test_text_message_serialization);
+    RUN_TEST(test_text_message_serialization_null);
+    RUN_TEST(test_text_message_serialization_long_text);
+    RUN_TEST(test_text_message_serialization_oversized);
+    RUN_TEST(test_text_message_serialization_invalid_utf8);
+
+    // Position tests
+    RUN_TEST(test_position_serialization);
+
+    // Nodeinfo tests
+    RUN_TEST(test_nodeinfo_serialization);
+
+    // Waypoint tests
+    RUN_TEST(test_waypoint_serialization);
+
+    // Telemetry tests
+    RUN_TEST(test_telemetry_device_metrics_serialization);
+    RUN_TEST(test_telemetry_environment_metrics_serialization);
+    RUN_TEST(test_telemetry_environment_metrics_comprehensive);
+    RUN_TEST(test_telemetry_environment_metrics_missing_fields);
+    RUN_TEST(test_telemetry_environment_metrics_complete_coverage);
+    RUN_TEST(test_telemetry_environment_metrics_unset_fields);
+
+    // Encrypted packet test
+    RUN_TEST(test_encrypted_packet_serialization);
+    RUN_TEST(test_empty_encrypted_packet);
+
+    // rx_time explicit-presence tests
+    RUN_TEST(test_timestamp_present_when_has_rx_time);
+    RUN_TEST(test_timestamp_zeroed_when_rx_time_absent);
+    RUN_TEST(test_encrypted_timestamp_zeroed_when_rx_time_absent);
+
+    // exit(), not a bare UNITY_END(): without it setup() returns and the runtime spins loop()
+    // forever, so the process never terminates even though the suite is finished.
+    exit(UNITY_END());
+}
+
+void loop()
+{
+    delay(1000);
+}

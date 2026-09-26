@@ -1,0 +1,94 @@
+#pragma once
+#if RADIOLIB_EXCLUDE_SX127X != 1
+#include "MeshRadio.h" // kinda yucky, but we need to know which region we are in
+#include "RadioLibInterface.h"
+#include "RadioLibRF95.h"
+
+#include <memory>
+
+/**
+ * Our new not radiohead adapter for RF95 style radios
+ */
+class RF95Interface : public RadioLibInterface
+{
+    // Either a RFM95 or RFM96 depending on what was stuffed on this board.
+    // Owned here; every other radio interface holds its driver by value, but this one is
+    // constructed in init(), so unique_ptr keeps it from leaking when init() fails and the
+    // interface is destroyed.
+    std::unique_ptr<RadioLibRF95> lora;
+
+  public:
+    RF95Interface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
+                  RADIOLIB_PIN_TYPE busy);
+
+    // TODO: Verify that this irq flag works with RFM95 / SX1276 radios the way it used to
+    bool isIRQPending() override { return lora->getIRQFlags() & RADIOLIB_SX127X_MASK_IRQ_FLAG_VALID_HEADER; }
+
+    /// Initialise the Driver transport hardware and software.
+    /// Make sure the Driver is properly configured before calling init().
+    /// \return true if initialisation succeeded.
+    virtual bool init() override;
+
+    /// Apply any radio provisioning changes
+    /// Make sure the Driver is properly configured before calling init().
+    /// \return true if initialisation succeeded.
+    virtual bool reconfigure() override;
+
+    /// Prepare hardware for sleep.  Call this _only_ for deep sleep, not needed for light sleep.
+    virtual bool sleep() override;
+
+  protected:
+    /**
+     * Glue functions called from ISR land
+     */
+    virtual void clearRadioIsr() override;
+
+    int16_t getCurrentRSSI() override;
+
+    /**
+     * Enable a particular ISR callback glue function
+     */
+    virtual void setRadioIsr(void (*callback)()) override { lora->setDio0Action(callback, RISING); }
+
+    /** can we detect a LoRa preamble on the current channel? */
+    virtual bool isChannelActive() override;
+
+    /** are we actively receiving a packet (only called during receiving state) */
+    virtual bool isActivelyReceiving() override;
+
+    /**
+     * Start waiting to receive a message
+     */
+    virtual void startReceive() override;
+
+    /**
+     * Add SNR data to received messages
+     */
+    virtual void addReceiveMetadata(meshtastic_MeshPacket *mp) override;
+
+    virtual void setStandby() override;
+
+    /**
+     *  We override to turn on transmitter power as needed.
+     */
+    virtual void configHardwareForSend() override;
+
+    uint32_t getPacketTime(uint32_t pl, bool received) override { return computePacketTime(*lora, pl, received); }
+
+  private:
+    /** Some boards require GPIO control of tx vs rx paths */
+    void setTransmitEnable(bool txon);
+
+    /** Program all modem parameters into the chip; returns the first RadioLib error, or RADIOLIB_ERR_NONE */
+    int16_t programModemParams();
+
+    /** begin() and chip-side setup, shared by init() and by reconfigure()'s recovery of a chip that lost its state */
+    bool reinitChip();
+
+    /** setStandby()'s body, returning the standby error instead of asserting - for callers that can recover */
+    int16_t trySetStandby();
+
+    /** Recover a chip that lost its runtime state: hardware-reset via begin() and reprogram */
+    bool recoverChipStateLoss() override { return reinitChip() && programModemParams() == RADIOLIB_ERR_NONE; }
+};
+#endif

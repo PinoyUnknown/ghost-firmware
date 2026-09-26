@@ -1,0 +1,140 @@
+#pragma once
+#if HAS_UDP_MULTICAST
+#include "configuration.h"
+#include "main.h"
+#include "mesh/Router.h"
+
+#if HAS_ETHERNET && defined(ARCH_NRF52)
+#include "mesh/eth/ethClient.h"
+#else
+#include <WiFi.h>
+#endif
+
+#include <AsyncUDP.h>
+
+#if HAS_ETHERNET && defined(ARCH_ESP32)
+#include <ETH.h>
+#if HAS_ETHERNET && defined(ETH_SHARED_SPI)
+#include "platform/esp32/SharedBusEthernet.h"
+#endif
+#endif // HAS_ETHERNET
+
+#define UDP_MULTICAST_DEFAUL_PORT 4403 // Default port for UDP multicast is same as TCP api server
+
+class UdpMulticastHandler final
+{
+  public:
+    UdpMulticastHandler() : isRunning(false) { udpIpAddress = IPAddress(239, 0, 0, 69); }
+
+    void start()
+    {
+        if (isRunning) {
+            LOG_DEBUG("UDP multicast already running");
+            return;
+        }
+        if (udp.listenMulticast(udpIpAddress, UDP_MULTICAST_DEFAUL_PORT, 64)) {
+#if defined(ARCH_NRF52) || defined(ARCH_PORTDUINO)
+            LOG_DEBUG("UDP Listening on IP: %u.%u.%u.%u:%u", udpIpAddress[0], udpIpAddress[1], udpIpAddress[2], udpIpAddress[3],
+                      UDP_MULTICAST_DEFAUL_PORT);
+#elif defined(USE_WS5500) || defined(USE_CH390D)
+            LOG_DEBUG("UDP Listening on IP: %s", ETH.localIP().toString().c_str());
+#else
+            LOG_DEBUG("UDP Listening on IP: %s", WiFi.localIP().toString().c_str());
+#endif
+            udp.onPacket([this](AsyncUDPPacket packet) { onReceive(packet); });
+            isRunning = true;
+        } else {
+            LOG_DEBUG("Failed to listen on UDP");
+        }
+    }
+
+    void stop()
+    {
+        if (!isRunning) {
+            return;
+        }
+        LOG_DEBUG("Stopping UDP multicast");
+#if defined(ARCH_ESP32) || defined(ARCH_NRF52)
+        udp.close();
+#endif
+        isRunning = false;
+    }
+
+    void onReceive(AsyncUDPPacket &packet)
+    {
+        if (!isRunning) {
+            return;
+        }
+        size_t packetLength = packet.length();
+#if defined(ARCH_NRF52)
+        IPAddress ip = packet.remoteIP();
+        LOG_DEBUG("UDP broadcast from: %u.%u.%u.%u, len=%u", ip[0], ip[1], ip[2], ip[3], packetLength);
+#elif !defined(ARCH_PORTDUINO)
+        // FIXME(PORTDUINO): arduino lacks IPAddress::toString()
+        LOG_DEBUG("UDP broadcast from: %s, len=%u", packet.remoteIP().toString().c_str(), packetLength);
+#endif
+        meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+        LOG_DEBUG("Decoding MeshPacket from UDP len=%u", packetLength);
+        bool isPacketDecoded = pb_decode_from_bytes(packet.data(), packetLength, &meshtastic_MeshPacket_msg, &mp);
+        if (isPacketDecoded && router && mp.which_payload_variant == meshtastic_MeshPacket_encrypted_tag) {
+            // Drop packets with spoofed local origin - no legitimate LAN node should send from=0 or our own nodeNum
+            if (isFromUs(&mp)) {
+                LOG_WARN("UDP packet with spoofed local from=0x%08x, dropping", mp.from);
+                return;
+            }
+            // Same clamp the MQTT ingress applies: an out-of-range hop count is not relayable.
+            if (mp.hop_limit > HOP_MAX || mp.hop_start > HOP_MAX) {
+                LOG_WARN("UDP packet with invalid hop_limit(%u) or hop_start(%u), dropping", mp.hop_limit, mp.hop_start);
+                return;
+            }
+            mp.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP;
+            // Authentication metadata is local-only; Router re-establishes it after successful PKI decryption.
+            mp.pki_encrypted = false;
+            mp.public_key.size = 0;
+            UniquePacketPoolPacket p = packetPool.allocUniqueCopy(mp);
+            if (!p)
+                return;
+            // Unset received SNR/RSSI - no local RF measurement exists for a UDP arrival. rx_rssi
+            // has explicit presence, so also clear has_rx_rssi: `mp` may have arrived already
+            // carrying a real measurement from whichever node forwarded it onto UDP, and leaving
+            // the presence bit set would misrepresent that stale value as "0 dBm over UDP".
+            p->rx_snr = 0;
+            p->rx_rssi = 0;
+            p->has_rx_rssi = false;
+            router->enqueueReceivedMessage(p.release());
+        }
+    }
+
+    bool onSend(const meshtastic_MeshPacket *mp)
+    {
+        if (!isRunning || !mp || !udp) {
+            return false;
+        }
+#if defined(ARCH_NRF52)
+        if (!isEthernetAvailable()) {
+            return false;
+        }
+#elif defined(USE_WS5500) || defined(USE_CH390D)
+        if (!ETH.connected()) {
+            return false;
+        }
+#elif !defined(ARCH_PORTDUINO)
+        if (WiFi.status() != WL_CONNECTED) {
+            return false;
+        }
+#endif
+        if (mp->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP) {
+            LOG_ERROR("Attempt to send UDP sourced packet over UDP");
+        }
+        LOG_DEBUG("Broadcasting packet over UDP (id=%u)", mp->id);
+        uint8_t buffer[meshtastic_MeshPacket_size];
+        size_t encodedLength = pb_encode_to_bytes(buffer, sizeof(buffer), &meshtastic_MeshPacket_msg, mp);
+        return udp.writeTo(buffer, encodedLength, udpIpAddress, UDP_MULTICAST_DEFAUL_PORT);
+    }
+
+  private:
+    IPAddress udpIpAddress;
+    AsyncUDP udp;
+    bool isRunning;
+};
+#endif // HAS_UDP_MULTICAST

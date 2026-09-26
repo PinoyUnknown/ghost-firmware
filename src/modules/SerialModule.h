@@ -1,0 +1,70 @@
+#pragma once
+
+#include "MeshModule.h"
+#include "Router.h"
+#include "SinglePortModule.h"
+#include "concurrency/OSThread.h"
+#include "configuration.h"
+#include <Arduino.h>
+#include <functional>
+
+// Is this serial config one we will accept? Outside the architecture guard below because it touches
+// no serial hardware, and AdminModule must run it on every platform - including those where
+// SerialModule itself does not exist. Logs and notifies the client on rejection.
+bool serialConfigIsValid(const meshtastic_ModuleConfig_SerialConfig &config);
+
+#if (defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040) || defined(ARCH_STM32WL)) &&                             \
+    !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(CONFIG_IDF_TARGET_ESP32C3)
+
+class SerialModule : public StreamAPI, private concurrency::OSThread
+{
+    bool firstTime = 1;
+    unsigned long lastNmeaTime = millis();
+    char outbuf[90] = "";
+
+  public:
+    SerialModule();
+
+  protected:
+    virtual int32_t runOnce() override;
+
+    /// Check the current underlying physical link to see if the client is currently connected
+    virtual bool checkIsConnected() override;
+
+  private:
+    uint32_t getBaudRate();
+    void sendTelemetry(meshtastic_Telemetry m);
+    void processWXSerial();
+};
+
+extern SerialModule *serialModule;
+
+/*
+ * Radio interface for SerialModule
+ *
+ */
+class SerialModuleRadio : public SinglePortModule
+{
+    uint32_t lastRxID = 0;
+    char outbuf[90] = "";
+
+  public:
+    SerialModuleRadio();
+
+    /**
+     * Send our payload into the mesh
+     */
+    void sendPayload(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false);
+
+  protected:
+    /** Called to handle a particular incoming message
+
+    @return ProcessMessage::STOP if you've guaranteed you've handled this message and no other handlers should be considered for
+    it
+    */
+    virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
+};
+
+extern SerialModuleRadio *serialModuleRadio;
+
+#endif

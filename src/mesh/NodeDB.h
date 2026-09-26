@@ -1,0 +1,974 @@
+#pragma once
+
+#include "Observer.h"
+#include <Arduino.h>
+#include <algorithm>
+#include <assert.h>
+#include <cstring>
+#include <map>
+#include <pb_encode.h>
+#include <string>
+#include <vector>
+
+#include "MeshTypes.h"
+#include "NodeStatus.h"
+#include "WarmNodeStore.h"
+#include "concurrency/Lock.h"
+#include "configuration.h"
+#include "mesh-pb-constants.h"
+#include "mesh/generated/meshtastic/mesh.pb.h" // For CriticalErrorCode
+
+#if ARCH_PORTDUINO
+#include "PortduinoGlue.h"
+#endif
+
+/// Decode-stream ceiling for a `nodes.proto` written by *other* firmware - a migration allowance,
+/// **not this build's node cap**. That is `MAX_NUM_NODES`, which on portduino is a runtime value
+/// (`portduino_config.MaxNodes`, default 200) rather than a compile-time constant. 250 is the
+/// largest hot cap any shipped firmware has used (ESP32-S3 top flash tier), so a file from any of
+/// them still decodes here; the excess is trimmed after load.
+static constexpr size_t NODEDB_MIGRATION_LOAD_CEILING = 250;
+
+#if !defined(MESHTASTIC_EXCLUDE_PKI)
+// E3B0C442 is the blank hash
+static const uint8_t LOW_ENTROPY_HASHES[][32] = {
+    {0xf4, 0x7e, 0xcc, 0x17, 0xe6, 0xb4, 0xa3, 0x22, 0xec, 0xee, 0xd9, 0x08, 0x4f, 0x39, 0x63, 0xea,
+     0x80, 0x75, 0xe1, 0x24, 0xce, 0x05, 0x36, 0x69, 0x63, 0xb2, 0xcb, 0xc0, 0x28, 0xd3, 0x34, 0x8b},
+    {0x5a, 0x9e, 0xa2, 0xa6, 0x8a, 0xa6, 0x66, 0xc1, 0x5f, 0x55, 0x00, 0x64, 0xa3, 0xa6, 0xfe, 0x71,
+     0xc0, 0xbb, 0x82, 0xc3, 0x32, 0x3d, 0x7a, 0x7a, 0xe3, 0x6e, 0xfd, 0xdd, 0xad, 0x3a, 0x66, 0xb9},
+    {0xb3, 0xdf, 0x3b, 0x2e, 0x67, 0xb6, 0xd5, 0xf8, 0xdf, 0x76, 0x2c, 0x45, 0x5e, 0x2e, 0xbd, 0x16,
+     0xc5, 0xf8, 0x67, 0xaa, 0x15, 0xf8, 0x92, 0x0b, 0xdf, 0x5a, 0x66, 0x50, 0xac, 0x0d, 0xbb, 0x2f},
+    {0x3b, 0x8f, 0x86, 0x3a, 0x38, 0x1f, 0x77, 0x39, 0xa9, 0x4e, 0xef, 0x91, 0x18, 0x5a, 0x62, 0xe1,
+     0xaa, 0x9d, 0x36, 0xea, 0xce, 0x60, 0x35, 0x8d, 0x9d, 0x1f, 0xf4, 0xb8, 0xc9, 0x13, 0x6a, 0x5d},
+    {0x36, 0x7e, 0x2d, 0xe1, 0x84, 0x5f, 0x42, 0x52, 0x29, 0x11, 0x0a, 0x25, 0x64, 0x54, 0x6a, 0x6b,
+     0xfd, 0xb6, 0x65, 0xff, 0x15, 0x1a, 0x51, 0x71, 0x22, 0x40, 0x57, 0xf6, 0x91, 0x9b, 0x64, 0x58},
+    {0x16, 0x77, 0xeb, 0xa4, 0x52, 0x91, 0xfb, 0x26, 0xcf, 0x8f, 0xd7, 0xd9, 0xd1, 0x5d, 0xc4, 0x68,
+     0x73, 0x75, 0xed, 0xc5, 0x95, 0x58, 0xee, 0x90, 0x56, 0xd4, 0x2f, 0x31, 0x29, 0xf7, 0x8c, 0x1f},
+    {0x31, 0x8c, 0xa9, 0x5e, 0xed, 0x3c, 0x12, 0xbf, 0x97, 0x9c, 0x47, 0x8e, 0x98, 0x9d, 0xc2, 0x3e,
+     0x86, 0x23, 0x90, 0x29, 0xc8, 0xb0, 0x20, 0xf8, 0xb1, 0xb0, 0xaa, 0x19, 0x2a, 0xcf, 0x0a, 0x54},
+    {0xa4, 0x8a, 0x99, 0x0e, 0x51, 0xdc, 0x12, 0x20, 0xf3, 0x13, 0xf5, 0x2b, 0x3a, 0xe2, 0x43, 0x42,
+     0xc6, 0x52, 0x98, 0xcd, 0xbb, 0xca, 0xb1, 0x31, 0xa0, 0xd4, 0xd6, 0x30, 0xf3, 0x27, 0xfb, 0x49},
+    {0xd2, 0x3f, 0x13, 0x8d, 0x22, 0x04, 0x8d, 0x07, 0x59, 0x58, 0xa0, 0xf9, 0x55, 0xcf, 0x30, 0xa0,
+     0x2e, 0x2f, 0xca, 0x80, 0x20, 0xe4, 0xde, 0xa1, 0xad, 0xd9, 0x58, 0xb3, 0x43, 0x2b, 0x22, 0x70},
+    {0x40, 0x41, 0xec, 0x6a, 0xd2, 0xd6, 0x03, 0xe4, 0x9a, 0x9e, 0xbd, 0x6c, 0x0a, 0x9b, 0x75, 0xa4,
+     0xbc, 0xab, 0x6f, 0xa7, 0x95, 0xff, 0x2d, 0xf6, 0xe9, 0xb9, 0xab, 0x4c, 0x0c, 0x1c, 0xd0, 0x3b},
+    {0x22, 0x49, 0x32, 0x2b, 0x00, 0xf9, 0x22, 0xfa, 0x17, 0x02, 0xe9, 0x64, 0x82, 0xf0, 0x4d, 0x1b,
+     0xc7, 0x04, 0xfc, 0xdc, 0x8c, 0x5e, 0xb6, 0xd9, 0x16, 0xd6, 0x37, 0xce, 0x59, 0xaa, 0x09, 0x49},
+    {0x48, 0x6f, 0x1e, 0x48, 0x97, 0x88, 0x64, 0xac, 0xe8, 0xeb, 0x30, 0xa3, 0xc3, 0xe1, 0xcf, 0x97,
+     0x39, 0xa6, 0x55, 0x5b, 0x5f, 0xbf, 0x18, 0xb7, 0x3a, 0xdf, 0xa8, 0x75, 0xe7, 0x9d, 0xe0, 0x1e},
+    {0x09, 0xb4, 0xe2, 0x6d, 0x28, 0x98, 0xc9, 0x47, 0x66, 0x46, 0xbf, 0xff, 0x58, 0x17, 0x91, 0xaa,
+     0xc3, 0xbf, 0x4a, 0x9d, 0x0b, 0x88, 0xb1, 0xf1, 0x03, 0xdd, 0x61, 0xd7, 0xba, 0x9e, 0x64, 0x98},
+    {0x39, 0x39, 0x84, 0xe0, 0x22, 0x2f, 0x7d, 0x78, 0x45, 0x18, 0x72, 0xb4, 0x13, 0xd2, 0x01, 0x2f,
+     0x3c, 0xa1, 0xb0, 0xfe, 0x39, 0xd0, 0xf1, 0x3c, 0x72, 0xd6, 0xef, 0x54, 0xd5, 0x77, 0x22, 0xa0},
+    {0x0a, 0xda, 0x5f, 0xec, 0xff, 0x5c, 0xc0, 0x2e, 0x5f, 0xc4, 0x8d, 0x03, 0xe5, 0x80, 0x59, 0xd3,
+     0x5d, 0x49, 0x86, 0xe9, 0x8d, 0xf6, 0xf6, 0x16, 0x35, 0x3d, 0xf9, 0x9b, 0x29, 0x55, 0x9e, 0x64},
+    {0x08, 0x56, 0xF0, 0xD7, 0xEF, 0x77, 0xD6, 0x11, 0x1C, 0x8F, 0x95, 0x2D, 0x3C, 0xDF, 0xB1, 0x22,
+     0xBF, 0x60, 0x9B, 0xE5, 0xA9, 0xC0, 0x6E, 0x4B, 0x01, 0xDC, 0xD1, 0x57, 0x44, 0xB2, 0xA5, 0xCF},
+    {0x2C, 0xB2, 0x77, 0x85, 0xD6, 0xB7, 0x48, 0x9C, 0xFE, 0xBC, 0x80, 0x26, 0x60, 0xF4, 0x6D, 0xCE,
+     0x11, 0x31, 0xA2, 0x1E, 0x33, 0x0A, 0x6D, 0x2B, 0x00, 0xFA, 0x0C, 0x90, 0x95, 0x8F, 0x5C, 0x6B},
+    {0xFA, 0x59, 0xC8, 0x6E, 0x94, 0xEE, 0x75, 0xC9, 0x9A, 0xB0, 0xFE, 0x89, 0x36, 0x40, 0xC9, 0x99,
+     0x4A, 0x3B, 0xF4, 0xAA, 0x12, 0x24, 0xA2, 0x0F, 0xF9, 0xD1, 0x08, 0xCB, 0x78, 0x19, 0xAA, 0xE5},
+    {0x6E, 0x42, 0x7A, 0x4A, 0x8C, 0x61, 0x62, 0x22, 0xA1, 0x89, 0xD3, 0xA4, 0xC2, 0x19, 0xA3, 0x83,
+     0x53, 0xA7, 0x7A, 0x0A, 0x89, 0xE2, 0x54, 0x52, 0x62, 0x3D, 0xE7, 0xCA, 0x8C, 0xF6, 0x6A, 0x60},
+    {0x20, 0x27, 0x2F, 0xBA, 0x0C, 0x99, 0xD7, 0x29, 0xF3, 0x11, 0x35, 0x89, 0x9D, 0x0E, 0x24, 0xA1,
+     0xC3, 0xCB, 0xDF, 0x8A, 0xF1, 0xC6, 0xFE, 0xD0, 0xD7, 0x9F, 0x92, 0xD6, 0x8F, 0x59, 0xBF, 0xE4},
+    {0x91, 0x70, 0xb4, 0x7c, 0xfb, 0xff, 0xa0, 0x59, 0x6a, 0x25, 0x1c, 0xa9, 0x9e, 0xe9, 0x43, 0x81,
+     0x5d, 0x74, 0xb1, 0xb1, 0x09, 0x28, 0x00, 0x4a, 0xaf, 0xe3, 0xfc, 0xa9, 0x4e, 0x27, 0x76, 0x4c},
+    {0x85, 0xfe, 0x7c, 0xec, 0xb6, 0x78, 0x74, 0xc3, 0xec, 0xe1, 0x32, 0x7f, 0xb0, 0xb7, 0x02, 0x74,
+     0xf9, 0x23, 0xd8, 0xe7, 0xfa, 0x14, 0xe6, 0xee, 0x66, 0x44, 0xb1, 0x8c, 0xa5, 0x2f, 0x7e, 0xd2},
+    {0x8e, 0x66, 0x65, 0x7b, 0x3b, 0x6f, 0x7e, 0xcc, 0x57, 0xb4, 0x57, 0xea, 0xcc, 0x83, 0xf5, 0xaa,
+     0xf7, 0x65, 0xa3, 0xce, 0x93, 0x72, 0x13, 0xc1, 0xb6, 0x46, 0x7b, 0x29, 0x45, 0xb5, 0xc8, 0x93},
+    {0xcc, 0x11, 0xfb, 0x1a, 0xab, 0xa1, 0x31, 0x87, 0x6a, 0xc6, 0xde, 0x88, 0x87, 0xa9, 0xb9, 0x59,
+     0x37, 0x82, 0x8d, 0xb2, 0xcc, 0xd8, 0x97, 0x40, 0x9a, 0x5c, 0x8f, 0x40, 0x55, 0xcb, 0x4c, 0x3e}};
+static const char LOW_ENTROPY_WARNING[] = "Compromised keys were detected and regenerated.";
+// Shown when a user tries to restore/set a known pre-2.8 low-entropy key: explains why the saved
+// key did not persist and that the node's identity (NodeNum == crc32(public_key)) changed with it.
+static const char LOW_ENTROPY_RESTORE_WARNING[] =
+    "That key is a known pre-2.8 low-entropy key and can't be restored. A new secure key was "
+    "generated; your node number has changed.";
+#endif
+static const char LICENSED_IDENTITY_MIGRATION_WARNING[] =
+    "Licensed signing generated a new identity key; this node identity changed.";
+/*
+DeviceState versions used to be defined in the .proto file but really only this function cares.  So changed to a
+#define here.
+*/
+
+#define SEGMENT_CONFIG 1
+#define SEGMENT_MODULECONFIG 2
+#define SEGMENT_DEVICESTATE 4
+#define SEGMENT_CHANNELS 8
+#define SEGMENT_NODEDATABASE 16
+
+#define DEVICESTATE_CUR_VER 25
+// Lowest on-disk version we still know how to load. v24 saves are migrated
+// at boot via the parallel deviceonly_legacy descriptor and re-saved as v25.
+#define DEVICESTATE_MIN_VER 24
+
+// One-time behavioral migration marker for the 2.8 position/telemetry opt-in flip.
+// Deliberately kept separate from DEVICESTATE_CUR_VER: that constant also drives the
+// NodeDatabase slim-schema legacy gate (NodeDB.cpp, `nodeDatabase.version < CUR_VER`),
+// so bumping it would wrongly re-run the v24 legacy decoder on already-migrated v25
+// node DBs. This watermark is stamped only onto channelFile.version / moduleConfig.version
+// once the opt-in migration has run. RESERVES 26 - the next real on-disk schema change
+// should raise DEVICESTATE_CUR_VER to 27, not 26.
+#define POSITION_TELEMETRY_OPTIN_VER 26
+
+extern meshtastic_DeviceState devicestate;
+extern meshtastic_NodeDatabase nodeDatabase;
+extern meshtastic_ChannelFile channelFile;
+extern meshtastic_MyNodeInfo &myNodeInfo;
+extern meshtastic_LocalConfig config;
+extern meshtastic_DeviceUIConfig uiconfig;
+extern meshtastic_LocalModuleConfig moduleConfig;
+extern meshtastic_User &owner;
+extern meshtastic_Position localPosition;
+
+static constexpr const char *deviceStateFileName = "/prefs/device.proto";
+static constexpr const char *legacyPrefFileName = "/prefs/db.proto";
+static constexpr const char *nodeDatabaseFileName = "/prefs/nodes.proto";
+// Event builds isolate radio profiles so normal firmware resumes its config and channels after OTA.
+static constexpr const char *STANDARD_CONFIG_FILE_NAME = "/prefs/config.proto";
+static constexpr const char *STANDARD_CHANNEL_FILE_NAME = "/prefs/channels.proto";
+static constexpr const char *EVENT_CONFIG_FILE_NAME = "/prefs/event-config.proto";
+static constexpr const char *EVENT_CHANNEL_FILE_NAME = "/prefs/event-channels.proto";
+static constexpr const char *STANDARD_BACKUP_FILE_NAME = "/backups/backup.proto";
+static constexpr const char *EVENT_BACKUP_FILE_NAME = "/backups/event-backup.proto";
+
+struct RadioProfileStoragePaths {
+    const char *config;
+    const char *channels;
+    const char *backup;
+};
+
+constexpr RadioProfileStoragePaths radioProfileStoragePaths(bool eventMode)
+{
+    return eventMode ? RadioProfileStoragePaths{EVENT_CONFIG_FILE_NAME, EVENT_CHANNEL_FILE_NAME, EVENT_BACKUP_FILE_NAME}
+                     : RadioProfileStoragePaths{STANDARD_CONFIG_FILE_NAME, STANDARD_CHANNEL_FILE_NAME, STANDARD_BACKUP_FILE_NAME};
+}
+
+// Reserve event files and their atomic temporaries before seeding, preventing retry formatting on full storage.
+static constexpr size_t EVENT_PROFILE_STORAGE_RESERVATION_BYTES = 2 * (meshtastic_LocalConfig_size + meshtastic_ChannelFile_size);
+
+constexpr bool hasEventProfileStorageSpace(size_t totalBytes, size_t usedBytes)
+{
+    return usedBytes <= totalBytes && totalBytes - usedBytes >= EVENT_PROFILE_STORAGE_RESERVATION_BYTES;
+}
+
+constexpr bool shouldDeferBootPersistence(bool bootInitializationInProgress, bool configLoadComplete, bool configDecodeFailed)
+{
+    return bootInitializationInProgress && (!configLoadComplete || configDecodeFailed);
+}
+
+#if USERPREFS_EVENT_MODE
+static constexpr auto RADIO_PROFILE_STORAGE = radioProfileStoragePaths(true);
+#else
+static constexpr auto RADIO_PROFILE_STORAGE = radioProfileStoragePaths(false);
+#endif
+static constexpr const char *configFileName = RADIO_PROFILE_STORAGE.config;
+static constexpr const char *channelFileName = RADIO_PROFILE_STORAGE.channels;
+static constexpr const char *backupFileName = RADIO_PROFILE_STORAGE.backup;
+static constexpr const char *uiconfigFileName = "/prefs/uiconfig.proto";
+static constexpr const char *moduleConfigFileName = "/prefs/module.proto";
+
+// An unverified config load only endangers the radio profile, so only these files take part in
+// boot-write deferral. Lives next to the path table above so the two cannot drift apart.
+inline bool isRadioProfileFile(const char *filename)
+{
+    return strcmp(filename, configFileName) == 0 || strcmp(filename, channelFileName) == 0 ||
+           strcmp(filename, backupFileName) == 0;
+}
+
+/// "No trustworthy arrival time", as distinct from "zero seconds ago". Deliberately huge so the
+/// display formatters fall into their existing unknown-age branches ("unknown age" / "?").
+inline constexpr uint32_t SINCE_UNKNOWN = UINT32_MAX;
+
+/// Given a node, return how many seconds in the past (vs now) that we last heard from it
+uint32_t sinceLastSeen(const meshtastic_NodeInfoLite *n);
+
+/// Given a packet, return how many seconds in the past (vs now) it was received,
+/// or SINCE_UNKNOWN if it carries no trustworthy rx_time.
+uint32_t sinceReceived(const meshtastic_MeshPacket *p);
+
+/// Outcome of mapping a single on-wire last-byte (next_hop / relay_node) back to a full NodeNum.
+/// Because the wire only carries the last byte of a 32-bit node number, the mapping is ambiguous on
+/// dense meshes (the "birthday problem"). Callers must treat Ambiguous and None as "don't trust it".
+enum class LastByteResolution : uint8_t {
+    None,      ///< no relevant candidate node has this last byte
+    Unique,    ///< exactly one relevant candidate -> `num` is valid
+    Ambiguous, ///< two or more relevant candidates collide on this byte
+};
+
+struct ResolvedNode {
+    LastByteResolution status = LastByteResolution::None;
+    NodeNum num = 0; ///< valid only when status == Unique
+};
+
+/// Given a packet, return the number of hops used to reach this node.
+/// Returns defaultIfUnknown if the number of hops couldn't be determined.
+int8_t getHopsAway(const meshtastic_MeshPacket &p, int8_t defaultIfUnknown = -1);
+
+enum class HopStartStatus : uint8_t { VALID = 0, MISSING_OR_UNKNOWN, INVALID };
+
+/// Classify hop_start validity for forwarding decisions.
+HopStartStatus classifyHopStart(const meshtastic_MeshPacket &p);
+
+inline bool shouldDropPacketForPreHop(const meshtastic_MeshPacket &p)
+{
+#if !MESHTASTIC_PREHOP_DROP
+    (void)p;
+    return false;
+#else
+    if (isFromUs(&p)) {
+        return false; // local-originated packets should never be dropped by pre-hop drop policy
+    }
+    // Pre-decode: the channel-encrypted bitfield isn't readable yet, so a missing/unknown hop_start can't be
+    // distinguished from a modern packet. Only drop the provably-corrupt case here; the bitfield-dependent
+    // verdict is re-checked post-decode in Router::handleReceived.
+    return classifyHopStart(p) == HopStartStatus::INVALID;
+#endif
+}
+
+/// Post-decode, the encrypted bitfield makes MISSING_OR_UNKNOWN decidable.
+/// Local packets are exempt; Router::dispatchReceived uses this predicate to set skipHandle.
+inline bool shouldSkipHandleForPostDecodeHop(const meshtastic_MeshPacket &p)
+{
+#if !MESHTASTIC_PREHOP_DROP
+    (void)p;
+    return false;
+#else
+    return !isFromUs(&p) && classifyHopStart(p) != HopStartStatus::VALID;
+#endif
+}
+
+/// Rate-limited debug log when hop_start is invalid/missing and packet is dropped.
+void logHopStartDrop(const meshtastic_MeshPacket &p, const char *context);
+
+/// 2.8 position/telemetry opt-in migration (pure field mutators; exposed for native tests).
+/// Disable position broadcast on every PUBLIC/default-PSK channel (precision -> 0); private-PSK
+/// channels (deliberate trusted groups) are left untouched.
+void optInDisablePositionSharing(meshtastic_ChannelFile &cf);
+/// Force all mesh-broadcast device telemetry (and the MQTT map-report location) back to opt-in/off.
+void optInDisableTelemetryBroadcast(meshtastic_LocalModuleConfig &mc);
+
+enum LoadFileResult {
+    // Successfully opened the file
+    LOAD_SUCCESS = 1,
+    // File does not exist
+    NOT_FOUND = 2,
+    // Device does not have a filesystem
+    NO_FILESYSTEM = 3,
+    // File exists, but could not decode protobufs
+    DECODE_FAILED = 4,
+    // File exists, but open failed for some reason
+    OTHER_FAILURE = 5
+};
+
+enum UserLicenseStatus { NotKnown, NotLicensed, Licensed };
+
+// RAM-only arrival stamp (monotonic uptime secs) for nodes heard before the wall clock was trusted,
+// backfilled into last_heard as an epoch once it is. last_heard persists, so it cannot hold this.
+// Bounded, linear-scan, reuse-oldest, never persisted - dies with the boot, as does its timebase.
+struct NodeHeardAt {
+    NodeNum num = 0;                ///< node this stamp describes; 0 == empty slot
+    uint32_t heardAtUptimeSecs = 0; ///< Time::getUptimeSecs() when last heard
+};
+
+/// What decides which LoRa slot this radio listens on. Only ever consumed as a fingerprint(), which
+/// is what each node stores and what the committed slot is compared against.
+struct LoraSlotSnapshot {
+    meshtastic_Config_LoRaConfig_RegionCode region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    bool use_preset = false;
+    /// Only the modem fields actually in force are populated - see loraSlotSnapshotFrom().
+    meshtastic_Config_LoRaConfig_ModemPreset modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    uint16_t bandwidth = 0;
+    uint32_t spread_factor = 0;
+    uint8_t coding_rate = 0;
+    float override_frequency = 0;
+    uint16_t channel_num = 0;
+    /// Channels::getName(); 16 covers name[12] and the preset name it substitutes for an empty one.
+    char primary_channel_name[16] = {0};
+
+    /// Fold into the NODEINFO_BITFIELD_HEARD_SLOT_BITS-wide value stored per node. A collision only
+    /// costs a node heard on one slot reading as heard on another, which 12 bits makes remote.
+    uint16_t fingerprint() const;
+};
+
+/// Normalises to the modem fields actually in force, so editing a dormant one is not a slot change.
+LoraSlotSnapshot loraSlotSnapshotFrom(const meshtastic_Config_LoRaConfig &lora, const char *primaryChannelName);
+
+class NodeDB
+{
+    // NodeNum provisionalNodeNum; // if we are trying to find a node num this is our current attempt
+
+    // A NodeInfo for every node we've seen
+    // Eventually use a smarter datastructure
+    // HashMap<NodeNum, NodeInfo> nodes;
+    // Note: these two references just point into our static array we serialize to/from disk
+
+  public:
+    std::vector<meshtastic_NodeInfoLite> *meshNodes;
+    bool updateGUI = false; // we think the gui should definitely be redrawn, screen will clear this once handled
+    meshtastic_NodeInfoLite *updateGUIforNode = NULL; // if currently showing this node, we think you should update the GUI
+    Observable<const meshtastic::NodeStatus *> newStatus;
+    pb_size_t numMeshNodes;
+
+    // Satellite per-NodeNum maps. std::map avoids unordered_map's bucket-array
+    // preallocation; O(log N) lookup is fine at these sizes.
+#if !MESHTASTIC_EXCLUDE_POSITIONDB
+    std::map<NodeNum, meshtastic_PositionLite> nodePositions;
+#endif
+#if !MESHTASTIC_EXCLUDE_TELEMETRYDB
+    std::map<NodeNum, meshtastic_DeviceMetrics> nodeTelemetry;
+#endif
+#if !MESHTASTIC_EXCLUDE_ENVIRONMENTDB
+    std::map<NodeNum, meshtastic_EnvironmentMetrics> nodeEnvironment;
+#endif
+#if !MESHTASTIC_EXCLUDE_STATUSDB
+    std::map<NodeNum, meshtastic_StatusMessage> nodeStatus;
+#endif
+
+    bool keyIsLowEntropy = false;
+    bool hasWarned = false;
+    bool licensedIdentityMigrationPending = false;
+
+    /// don't do mesh based algorithm for node id assignment (initially)
+    /// instead just store in flash - possibly even in the initial alpha release do this hack
+    NodeDB();
+
+    /// write to flash
+    /// @return true if the save was successful
+    bool saveToDisk(int saveWhat = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS |
+                                   SEGMENT_NODEDATABASE);
+
+    /** Reinit radio config if needed, because either:
+     * a) sometimes a buggy android app might send us bogus settings or
+     * b) the client set factory_reset
+     *
+     * @param factory_reset if true, reset all settings to factory defaults
+     * @param is_fresh_install set to true after a fresh install, to trigger NodeInfo/Position requests
+     * @return true if the config was completely reset, in that case, we should send it back to the client
+     */
+    void resetRadioConfig(bool is_fresh_install = false);
+
+    /// given a subpacket sniffed from the network, update our DB state
+    /// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
+    void updateFrom(const meshtastic_MeshPacket &p);
+
+    /// Re-read which slot this radio is committed to. Cheap, touches no node and writes nothing, so
+    /// it is safe on every config write - a client hopping presets just moves it and moves it back.
+    void refreshCommittedLoraSlot();
+
+    /// Fingerprint of the slot the radio is committed to, which a node's stored slot is compared
+    /// against to derive NodeInfo.heard_on_current_lora.
+    uint16_t committedLoraSlot() const { return committedSlot; }
+
+    /// Declare that config.lora holds a temporary radio switch - a beacon keying up on another preset.
+    /// While set the committed slot is pinned, so neither the switch nor its restore reads as a move.
+    void setLoraSlotTransient(bool transient) { loraSlotTransient = transient; }
+
+    void addFromContact(const meshtastic_SharedContact);
+
+    /// On the clock-becoming-trusted transition (see RTC.cpp): convert every RAM arrival stamp into
+    /// a real last_heard epoch, never backwards, then empty the table. updateFrom() takes over.
+    void backfillHeardAt();
+
+    /** Update position info for this node based on received position data
+     */
+    void updatePosition(uint32_t nodeId, const meshtastic_Position &p, RxSource src = RX_SRC_RADIO);
+
+    /** Update telemetry info for this node based on received metrics
+     */
+    void updateTelemetry(uint32_t nodeId, const meshtastic_Telemetry &t, RxSource src = RX_SRC_RADIO);
+
+    /** Update user info and channel for this node based on received user data.
+     * A known signer's identity is only learned when xeddsaSigned; defaults false so callers fail closed. */
+    bool updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex = 0, bool xeddsaSigned = false);
+
+    /*
+     * Sets a node either favorite or unfavorite. Returns true if the node ends
+     * up in the requested state; false if the node is unknown or favouriting
+     * was refused by the protected-node cap (MAX_NUM_NODES - 2).
+     */
+    bool set_favorite(bool is_favorite, uint32_t nodeId);
+
+    /// Count of eviction-protected (favourite/ignored/manually-verified) nodes.
+    int numProtectedNodes() const;
+
+    /// printf-style warning emitted when setProtectedFlag() refuses a node at
+    /// the cap. %s = verb (favorite/ignore), 0x%08x = node, %d = cap. Shared by
+    /// LOG_WARN here and AdminModule::sendWarning so the wording stays in sync.
+    static constexpr const char *PROTECTED_CAP_WARN_FMT = "Can't %s 0x%08x: protected-node limit (%d) reached";
+
+    /// Turn an eviction-protection flag (favourite/ignored/verified) on/off. Off
+    /// always succeeds; on returns false (no change) once the protected set hits
+    /// the cap (MAX_NUM_NODES-2), keeping >=2 always-evictable slots. Callers
+    /// surface the refusal to the user.
+    bool setProtectedFlag(meshtastic_NodeInfoLite *node, uint32_t mask, bool on);
+
+    /*
+     * Returns true if the node is in the NodeDB and marked as favorite
+     */
+    bool isFavorite(uint32_t nodeId);
+
+    /*
+     * Returns true if p->from or p->to is a favorited node
+     */
+    bool isFromOrToFavoritedNode(const meshtastic_MeshPacket &p);
+
+    /**
+     * Other functions like the node picker can request a pause in the node sorting
+     */
+    void pause_sort(bool paused);
+
+    /// @return our node number
+    NodeNum getNodeNum() { return myNodeInfo.my_node_num; }
+
+    /// @return our node ID as a string in the format "!xxxxxxxx"
+    std::string getNodeId() const;
+
+    // @return last byte of a NodeNum, 0xFF if it ended at 0x00
+    uint8_t getLastByteOfNodeNum(NodeNum num) { return (uint8_t)((num & 0xFF) ? (num & 0xFF) : 0xFF); }
+
+    /// if returns false, that means our node should send a DenyNodeNum response.  If true, we think the number is okay for use
+    // bool handleWantNodeNum(NodeNum n);
+
+    /* void handleDenyNodeNum(NodeNum FIXME read mesh proto docs, perhaps picking a random node num is not a great idea
+    and instead we should use a special 'im unconfigured node number' and include our desired node number in the wantnum message.
+    the unconfigured node num would only be used while initially joining the mesh so low odds of conflicting (especially if we
+    randomly select from a small number of nodenums which can be used temporarily for this operation).  figure out what the lower
+    level mesh sw does if it does conflict?  would it be better for people who are replying with denynode num to just broadcast
+    their denial?)
+    */
+
+    // get channel channel index we heard a nodeNum on, defaults to 0 if not found
+    uint8_t getMeshNodeChannel(NodeNum n);
+
+    /* Return the number of nodes we've heard from recently (within the last 2 hrs?)
+     * @param localOnly if true, ignore nodes heard via MQTT
+     */
+    size_t getNumOnlineMeshNodes(bool localOnly = false);
+
+    void initConfigIntervals(), initModuleConfigIntervals(), resetNodes(bool keepFavorites = false),
+        removeNodeByNum(NodeNum nodeNum);
+
+    bool factoryReset(bool eraseBleBonds = false);
+
+    LoadFileResult loadProto(const char *filename, size_t protoSize, size_t objSize, const pb_msgdesc_t *fields,
+                             void *dest_struct);
+    bool saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct,
+                   bool fullAtomic = true);
+
+    void installRoleDefaults(meshtastic_Config_DeviceConfig_Role role);
+
+    const meshtastic_NodeInfoLite *readNextMeshNode(uint32_t &readIndex);
+
+    meshtastic_NodeInfoLite *getMeshNodeByIndex(size_t x)
+    {
+        assert(x < numMeshNodes);
+        return &meshNodes->at(x);
+    }
+
+    virtual meshtastic_NodeInfoLite *getMeshNode(NodeNum n);
+    size_t getNumMeshNodes() { return numMeshNodes; }
+    /// Find a node in our DB, create an empty NodeInfoLite if missing (evicting
+    /// the oldest non-protected node when full). Public so admin handlers can
+    /// register a node we have not heard from yet (e.g. to block it by ID).
+    meshtastic_NodeInfoLite *getOrCreateMeshNode(NodeNum n);
+
+#if WARM_NODE_COUNT > 0
+    // Warm ("long-tail") tier: minimal {num, last_heard, public_key} records
+    // for nodes evicted from the hot store. See WarmNodeStore.h.
+    WarmNodeStore warmStore;
+#endif
+
+    /// Copy the 32-byte public key for node n - hot store first, then the warm
+    /// tier. Returns false if we don't know a key for n.
+    bool copyPublicKey(NodeNum n, meshtastic_NodeInfoLite_public_key_t &out);
+
+    /// Copy the 32-byte key for n from the AUTHORITATIVE tiers only (hot, then warm; never
+    /// opportunistic caches) - the pin reference for caches that mirror NodeDB's key hygiene.
+    bool copyPublicKeyAuthoritative(NodeNum n, meshtastic_NodeInfoLite_public_key_t &out);
+
+    /// Key for the inbound-decrypt path: authoritative (hot/warm), or a cold-tier cache key only when
+    /// it is key-proven. Keeps unverified TOFU cache keys from backing pki_encrypted attribution.
+    bool copyPublicKeyForDecrypt(NodeNum n, meshtastic_NodeInfoLite_public_key_t &out);
+
+    /// True if n is a known XEdDSA signer for exactly `key32` (hot signed bitfield or warm
+    /// xeddsa-signed bit); the key match stops a rotated key inheriting a stale signer verdict.
+    bool isVerifiedSignerForKey(NodeNum n, const uint8_t *key32);
+
+    /// Key-agnostic "should n's signable traffic arrive signed", per hot bitfield or warm
+    /// xeddsa-signed bit - hot-only gates would let a warm-evicted signer be impersonated with unsigned frames.
+    bool isKnownXeddsaSigner(NodeNum n);
+
+    /// Provenance of a bare-key commit that deliberately bypasses updateUser()'s
+    /// User-payload / TOFU-pin path. Maps to the TrafficManagement cache's `proven` flag:
+    /// only ManuallyVerified vouches for possession of exactly this key.
+    enum class KeyCommitTrust : uint8_t {
+        AdminChannelProven, // possession shown to the admin channel (AEAD) - TOFU-grade for signing
+        ManuallyVerified,   // the user confirmed possession of exactly this key
+    };
+
+    /// THE primitive for key writes that bypass updateUser() (no User payload; provenance
+    /// differs from a received NodeInfo): writes the 32-byte key to the hot store and
+    /// write-through to the TrafficManagement NodeInfo cache. Any future direct key-write
+    /// site must call this rather than assigning info->public_key, or the TrafficManagement
+    /// cache silently diverges until the next hourly reconcile.
+    void commitRemoteKey(NodeNum n, const uint8_t key32[32], KeyCommitTrust trust);
+
+    /// Resolve a node's device role - hot store (with user) first, then the role
+    /// cached in the warm tier, else CLIENT. Lets role-aware policy keep firing for
+    /// nodes that have aged out of the hot store.
+    meshtastic_Config_DeviceConfig_Role getNodeRole(NodeNum n);
+
+    /// last_heard of a hot-store node, or 0 if absent. Plain scan of meshNodes
+    /// with no allocation side effects (unlike getOrCreateMeshNode).
+    uint32_t hotNodeLastHeard(NodeNum n) const;
+
+    /**
+     * Resolve a single on-wire last-byte (e.g. next_hop / relay_node) back to a unique full NodeNum,
+     * detecting last-byte collisions instead of silently picking the first match. A 1-byte id only
+     * needs to be unique among a node's plausible relays, not the whole mesh, so we scope the search:
+     *  - requireDirectNeighbor == true  : candidates are direct neighbors (hops_away==0) heard within
+     *                                     NEXTHOP_NEIGHBOR_FRESH_SECS. Use on the SEND path.
+     *  - requireDirectNeighbor == false : also accept favorites and router-role nodes (unknown hop
+     *                                     distance allowed). Use when learning / preserving hops.
+     * Ignored nodes, our own node, and the broadcast/0 sentinels are never candidates. On a tie the
+     * result is Ambiguous (no tie-break) so callers fall back to flooding rather than misroute.
+     */
+    ResolvedNode resolveLastByte(uint8_t lastByte, bool requireDirectNeighbor);
+
+    /// Convenience wrapper around resolveLastByte(): true iff exactly one relevant candidate matches.
+    /// Ambiguous and None both return false (the safe answer for learning / hop preservation).
+    bool resolveUniqueLastByte(uint8_t lastByte, bool requireDirectNeighbor, NodeNum *outNum = nullptr);
+
+    // Thread-safe satellite-map accessors. Return false if absent or the
+    // corresponding DB is compiled out.
+    bool copyNodePosition(NodeNum n, meshtastic_PositionLite &out) const;
+    bool copyNodeTelemetry(NodeNum n, meshtastic_DeviceMetrics &out) const;
+    bool copyNodeEnvironment(NodeNum n, meshtastic_EnvironmentMetrics &out) const;
+    bool copyNodeStatus(NodeNum n, meshtastic_StatusMessage &out) const;
+    std::vector<NodeNum> snapshotPositionNodeNums(NodeNum exclude) const;
+    std::vector<NodeNum> snapshotTelemetryNodeNums(NodeNum exclude) const;
+    std::vector<NodeNum> snapshotEnvironmentNodeNums(NodeNum exclude) const;
+    std::vector<NodeNum> snapshotStatusNodeNums(NodeNum exclude) const;
+
+    void setNodeStatus(NodeNum n, const meshtastic_StatusMessage &status);
+    void touchNodePositionTime(NodeNum n, uint32_t time);
+
+    bool hasNodePosition(NodeNum n) const
+    {
+        meshtastic_PositionLite scratch;
+        return copyNodePosition(n, scratch);
+    }
+    bool hasNodeTelemetry(NodeNum n) const
+    {
+        meshtastic_DeviceMetrics scratch;
+        return copyNodeTelemetry(n, scratch);
+    }
+    bool hasNodeEnvironment(NodeNum n) const
+    {
+        meshtastic_EnvironmentMetrics scratch;
+        return copyNodeEnvironment(n, scratch);
+    }
+    bool hasNodeStatus(NodeNum n) const
+    {
+        meshtastic_StatusMessage scratch;
+        return copyNodeStatus(n, scratch);
+    }
+
+    void eraseNodeSatellites(NodeNum n);
+
+    UserLicenseStatus getLicenseStatus(uint32_t nodeNum);
+
+    size_t getMaxNodesAllocatedSize()
+    {
+        meshtastic_NodeDatabase emptyNodeDatabase;
+        emptyNodeDatabase.version = DEVICESTATE_CUR_VER;
+        size_t nodeDatabaseSize;
+        pb_get_encoded_size(&nodeDatabaseSize, meshtastic_NodeDatabase_fields, &emptyNodeDatabase);
+        // Decode-stream size ceiling only - no buffer this big is allocated (load
+        // streams from the file). Sized for the largest file any prior firmware
+        // could write, so capacity downgrades / peer backups still decode; excess
+        // is trimmed after load. See NODEDB_MIGRATION_LOAD_CEILING above - it is a
+        // migration allowance, not this build's cap.
+        // (not constexpr: portduino resolves MAX_NUM_NODES from runtime config)
+        const size_t loadCeiling =
+            ((size_t)MAX_NUM_NODES > NODEDB_MIGRATION_LOAD_CEILING) ? (size_t)MAX_NUM_NODES : NODEDB_MIGRATION_LOAD_CEILING;
+        return nodeDatabaseSize + (loadCeiling * meshtastic_NodeInfoLite_size) +
+               (loadCeiling * meshtastic_NodePositionEntry_size) + (loadCeiling * meshtastic_NodeTelemetryEntry_size) +
+               (loadCeiling * meshtastic_NodeEnvironmentEntry_size) + (loadCeiling * meshtastic_NodeStatusEntry_size);
+    }
+
+    // returns true if the maximum number of nodes is reached or we are running low on memory
+    bool isFull();
+
+    // returns true only if more than half the node slots are still empty (and memory is not tight)
+    bool isHalfEmpty() const;
+
+    void clearLocalPosition();
+
+    void setLocalPosition(meshtastic_Position position, bool timeOnly = false)
+    {
+        if (timeOnly) {
+            LOG_DEBUG("Set local position time only: time=%u timestamp=%u", position.time, position.timestamp);
+            localPosition.time = position.time;
+            localPosition.timestamp = position.timestamp > 0 ? position.timestamp : position.time;
+            return;
+        }
+        LOG_DEBUG("Set local position: lat=%i lon=%i time=%u timestamp=%u", position.latitude_i, position.longitude_i,
+                  position.time, position.timestamp);
+        localPosition = position;
+        if (position.latitude_i != 0 || position.longitude_i != 0) {
+            localPositionUpdatedSinceBoot = true;
+        }
+    }
+
+    bool hasValidPosition(const meshtastic_NodeInfoLite *n);
+    bool hasLocalPositionSinceBoot() const { return localPositionUpdatedSinceBoot; }
+
+#if !defined(MESHTASTIC_EXCLUDE_PKI)
+    bool checkLowEntropyPublicKey(const meshtastic_Config_SecurityConfig_public_key_t &keyToTest);
+#endif
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    bool generateBlacklistCheckedKeyPair();
+    bool derivePublicKeyFromPrivate();
+#endif
+
+    /// Consolidate crypto key generation logic used across multiple modules
+    /// @param privateKey Optional 32-byte private key to use. If nullptr, generates new random keys.
+    bool generateCryptoKeyPair(const uint8_t *privateKey = nullptr);
+
+    bool notifyPendingLicensedIdentityMigration();
+
+    bool createNewIdentity();
+
+    /// Mint the identity keypair outside the boot path and re-seat my_node_num == crc32(public_key).
+    /// @return true if my_node_num moved; the caller must then also persist SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE.
+    bool ensurePkiIdentity();
+
+    bool backupPreferences(meshtastic_AdminMessage_BackupLocation location);
+    bool restorePreferences(meshtastic_AdminMessage_BackupLocation location,
+                            int restoreWhat = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS);
+
+    /// Notify observers of changes to the DB
+    void notifyObservers(bool forceUpdate = false)
+    {
+        // Notify observers of the current node state
+        const meshtastic::NodeStatus status = meshtastic::NodeStatus(getNumOnlineMeshNodes(), getNumMeshNodes(), forceUpdate);
+        newStatus.notifyObservers(&status);
+    }
+
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+    /// Re-run loadFromDisk() after the encrypted storage is unlocked at runtime.
+    /// Trigger: PhoneAPI::handleLockdownAuthInline sets lockdownReloadPending
+    /// on a successful provisionPassphrase / unlockWithPassphrase; the main
+    /// loop in main.cpp services the flag and calls this method on the main
+    /// thread. The transport callback stack (BLE/USB) is too small for the
+    /// file IO + MAX_NUM_NODES vector reserve + proto decode this triggers.
+    ///
+    /// Returns true iff every encrypted file decrypted and decoded cleanly.
+    /// On false the caller MUST treat the storage as corrupt: leave the
+    /// connection unauthenticated, emit a LOCKED(storage_corrupt) status,
+    /// and refuse to call setAdminAuthorized - otherwise a subsequent
+    /// set_config would re-encrypt a wrong baseline (the locked-default
+    /// values still resident in `config` / `channelFile` / `nodeDatabase`)
+    /// and overwrite the operator's persisted state.
+    bool reloadFromDisk();
+
+    /// Disable lockdown: decrypt every encrypted pref file back to plaintext,
+    /// then remove the DEK / token / counter / backoff artifacts. Requires
+    /// EncryptedStorage to be unlocked (DEK in RAM). Returns false if any
+    /// file failed to revert - in which case the DEK is still present and the
+    /// device remains in lockdown so the operator can retry. APPROTECT is not
+    /// reversed. Called from the main loop via lockdownDisablePending.
+    bool disableLockdownToPlaintext();
+
+    /// Set by loadProto when any encrypted file fails to decrypt or decode.
+    /// Tracked across an entire loadFromDisk pass so reloadFromDisk can
+    /// surface the condition without callers re-walking each loadProto
+    /// result. Cleared at the top of every loadFromDisk run.
+    bool storageCorruptThisLoad = false;
+#endif
+
+  private:
+    mutable concurrency::Lock satelliteMutex;
+    bool duplicateWarned = false;
+    bool localPositionUpdatedSinceBoot = false;
+    bool migrationSavePending = false;
+    /// Set when loadFromDisk() hit a present-but-undecodable config (DECODE_FAILED). The ctor uses it to
+    /// skip boot keygen and skip persisting defaults, so a transient read failure can't change our NodeNum
+    /// or overwrite the on-disk config. Cleared at the top of every loadFromDisk() run.
+    bool configDecodeFailed = false;
+    // Defer automatic writes until config load is healthy to protect device and node data from damaged configs.
+    bool bootInitializationInProgress = true;
+    bool configLoadComplete = false;
+#if USERPREFS_EVENT_MODE
+    // The active event profile is intentionally non-durable when there was not
+    // enough room to create it safely at boot. A later boot retries the check.
+    bool eventProfileStorageUnavailable = false;
+#endif
+    uint32_t lastNodeDbSave = 0;     // when we last saved our db to flash
+    uint32_t lastFullEvictionMs = 0; // when we last evicted to admit a new node, once the db is full
+    uint32_t lastBackupAttempt = 0;  // when we last tried a backup automatically or manually
+    uint32_t lastSort = 0;           // When last sorted the nodeDB
+
+    /// See NodeHeardAt. Caps how many distinct nodes can be dated once the clock arrives; a node
+    /// pushed out by reuse-oldest just stays "last heard: unknown", the same as before this table.
+    static constexpr size_t kMaxHeardAt = 32;
+    NodeHeardAt heardAt[kMaxHeardAt] = {};
+
+    /// Stamp (or re-stamp) a node's RAM arrival record; used instead of writing a non-epoch into
+    /// last_heard whenever the wall clock is untrusted.
+    void recordHeardWhileClockUntrusted(NodeNum num, uint32_t heardAtUptimeSecs);
+
+    /// addFromContact's anti-eviction stamp: a real epoch when the clock is trusted, otherwise a
+    /// RAM arrival stamp that evictionRecency() honours - never a boot-relative last_heard.
+    void stampContactHeardNow(meshtastic_NodeInfoLite *info);
+
+    /// Read the node's RAM arrival stamp. The boolean carries presence because uptime second 0 is valid.
+    bool getHeardAtUptimeSecs(NodeNum num, uint32_t &stamp) const;
+
+    struct EvictionRecency {
+        uint32_t value;
+        bool heardThisBoot;
+    };
+
+    /// Eviction ranking with current-boot stamps newer than every persisted epoch.
+    EvictionRecency evictionRecency(const meshtastic_NodeInfoLite *n) const;
+    static bool evictionRecencyOlder(EvictionRecency candidate, EvictionRecency incumbent);
+
+    /// The slot this radio is committed to; see refreshCommittedLoraSlot().
+    uint16_t committedSlot = 0;
+    bool loraSlotTransient = false;
+    LoraSlotSnapshot currentLoraSlot() const;
+
+    /*
+     * Internal boolean to track sorting paused
+     */
+    bool sortingIsPaused = false;
+
+    /// pick a provisional nodenum we hope no one is using
+    void pickNewNodeNum();
+
+    /// read our db from flash
+    void loadFromDisk();
+
+#ifdef PIO_UNIT_TESTING
+    // Grant the unit-test shim access to the private maintenance paths below
+    // (migration / cleanup / eviction) without relaxing production access.
+    friend class NodeDBTestShim;
+    friend class MockNodeDB;
+#endif
+
+    /// purge db entries without user info
+    void cleanupMeshDB();
+
+    /// Trim each satellite map down to MAX_SATELLITE_NODES, dropping the
+    /// stalest entries (used after loading files written before the cap, or by
+    /// a build with a larger cap). Returns true iff anything was trimmed.
+    bool enforceSatelliteCaps();
+
+    /// Node-DB self-care; call only once identity is established (getNodeNum()
+    /// valid). Confirms self is present, trims/demotes only NON-self overflow, and
+    /// rewrites the store once when something changed (never while storage locked).
+    void nodeDBSelfCare();
+
+#if WARM_NODE_COUNT > 0
+    /// A database from a larger-cap build (e.g. the pre-fork 150-node nRF52 store)
+    /// can exceed MAX_NUM_NODES on load. Rank the hot store, demote the oldest
+    /// overflow into the warm tier preserving {num, last_heard, public_key} so PKI
+    /// DMs survive instead of dropping on truncation.
+    void demoteOldestHotNodesToWarm();
+#endif
+
+    /// Reinit device state from scratch (not loading from disk)
+    void installDefaultDeviceState(), installDefaultNodeDatabase(), installDefaultChannels(),
+        installDefaultConfig(bool preserveKey), installDefaultModuleConfig();
+
+    /// write to flash
+    /// @return true if the save was successful
+    bool saveToDiskNoRetry(int saveWhat);
+
+    bool saveChannelsToDisk();
+    bool saveDeviceStateToDisk();
+    bool saveNodeDatabaseToDisk();
+    void sortMeshDB();
+
+    // Defined in NodeDBLegacyMigration.cpp. Decodes /prefs/nodes.proto via
+    // the legacy descriptor and copies entries into the v25 layout. Caller
+    // is responsible for save / install-default on the result.
+    bool migrateLegacyNodeDatabase();
+
+    // Route satellite-store decode entries straight into our maps instead of
+    // temp vectors. Must be paired - disarm before any other NodeDatabase decode.
+    void armNodeDatabaseDecodeTargets();
+    void disarmNodeDatabaseDecodeTargets();
+};
+
+extern NodeDB *nodeDB;
+
+/*
+  If is_router is set, we use a number of different default values
+
+        # FIXME - after tuning, move these params into the on-device defaults based on is_router and is_power_saving
+
+        # prefs.position_broadcast_secs = FIXME possibly broadcast only once an hr
+        prefs.wait_bluetooth_secs = 1  # Don't stay in bluetooth mode
+        # try to stay in light sleep one full day, then briefly wake and sleep again
+
+        prefs.ls_secs = oneday
+
+        prefs.position_broadcast_secs = 12 hours # send either position or owner every 12hrs
+
+        # get a new GPS position once per day
+        prefs.gps_update_interval = oneday
+
+        prefs.is_power_saving = True
+*/
+
+/** The current change # for radio settings.  Starts at 0 on boot and any time the radio settings
+ * might have changed is incremented.  Allows others to detect they might now be on a new channel.
+ */
+extern uint32_t radioGeneration;
+
+extern meshtastic_CriticalErrorCode error_code;
+
+/*
+ * A numeric error address (nonzero if available)
+ */
+extern uint32_t error_address;
+// Bit assignments for meshtastic_NodeInfoLite.bitfield.
+#define NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_SHIFT 0
+#define NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK (1u << NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_SHIFT)
+#define NODEINFO_BITFIELD_IS_MUTED_SHIFT 1
+#define NODEINFO_BITFIELD_IS_MUTED_MASK (1u << NODEINFO_BITFIELD_IS_MUTED_SHIFT)
+#define NODEINFO_BITFIELD_VIA_MQTT_SHIFT 2
+#define NODEINFO_BITFIELD_VIA_MQTT_MASK (1u << NODEINFO_BITFIELD_VIA_MQTT_SHIFT)
+#define NODEINFO_BITFIELD_IS_FAVORITE_SHIFT 3
+#define NODEINFO_BITFIELD_IS_FAVORITE_MASK (1u << NODEINFO_BITFIELD_IS_FAVORITE_SHIFT)
+#define NODEINFO_BITFIELD_IS_IGNORED_SHIFT 4
+#define NODEINFO_BITFIELD_IS_IGNORED_MASK (1u << NODEINFO_BITFIELD_IS_IGNORED_SHIFT)
+#define NODEINFO_BITFIELD_HAS_USER_SHIFT 5
+#define NODEINFO_BITFIELD_HAS_USER_MASK (1u << NODEINFO_BITFIELD_HAS_USER_SHIFT)
+#define NODEINFO_BITFIELD_IS_LICENSED_SHIFT 6
+#define NODEINFO_BITFIELD_IS_LICENSED_MASK (1u << NODEINFO_BITFIELD_IS_LICENSED_SHIFT)
+#define NODEINFO_BITFIELD_IS_UNMESSAGABLE_SHIFT 7
+#define NODEINFO_BITFIELD_IS_UNMESSAGABLE_MASK (1u << NODEINFO_BITFIELD_IS_UNMESSAGABLE_SHIFT)
+#define NODEINFO_BITFIELD_HAS_IS_UNMESSAGABLE_SHIFT 8
+#define NODEINFO_BITFIELD_HAS_IS_UNMESSAGABLE_MASK (1u << NODEINFO_BITFIELD_HAS_IS_UNMESSAGABLE_SHIFT)
+#define NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_SHIFT 9
+#define NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK (1u << NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_SHIFT)
+// snr_q4 (persisted, sint32) is proto3 singular, so 0 == "never written", but 0 dB is valid.
+// This bit disambiguates: whenever snr_q4 is written from a genuine RF measurement.
+// Use this instead of `if (snr_q4)`. Legacy records (bit clear) are unambiguously "unknown".
+#define NODEINFO_BITFIELD_HAS_SNR_SHIFT 10
+#define NODEINFO_BITFIELD_HAS_SNR_MASK (1u << NODEINFO_BITFIELD_HAS_SNR_SHIFT)
+// Set on a genuine RF hear, and with it the slot fingerprint below. Clear means never heard over our
+// own radio, so the fingerprint is meaningless - legacy records read that way and are correct.
+#define NODEINFO_BITFIELD_HAS_RF_HEAR_SHIFT 11
+#define NODEINFO_BITFIELD_HAS_RF_HEAR_MASK (1u << NODEINFO_BITFIELD_HAS_RF_HEAR_SHIFT)
+// Bits 12..23: fingerprint of the LoRa slot this node was last heard on. NodeInfo.heard_on_current_lora
+// is derived from it matching the slot the radio is committed to, which is what makes scanning harmless.
+#define NODEINFO_BITFIELD_HEARD_SLOT_SHIFT 12
+#define NODEINFO_BITFIELD_HEARD_SLOT_BITS 12
+#define NODEINFO_BITFIELD_HEARD_SLOT_MASK (((1u << NODEINFO_BITFIELD_HEARD_SLOT_BITS) - 1) << NODEINFO_BITFIELD_HEARD_SLOT_SHIFT)
+// Bits 24..31 reserved for future single-bit flags.
+
+// Convenience accessors so call sites read like the old struct fields.
+inline bool nodeInfoLiteHasUser(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HAS_USER_MASK);
+}
+inline bool nodeInfoLiteViaMqtt(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_VIA_MQTT_MASK);
+}
+inline bool nodeInfoLiteIsFavorite(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_FAVORITE_MASK);
+}
+inline bool nodeInfoLiteIsIgnored(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_IGNORED_MASK);
+}
+inline bool nodeInfoLiteIsLicensed(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_LICENSED_MASK);
+}
+inline bool nodeInfoLiteHasIsUnmessagable(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HAS_IS_UNMESSAGABLE_MASK);
+}
+inline bool nodeInfoLiteIsUnmessagable(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_UNMESSAGABLE_MASK);
+}
+inline bool nodeInfoLiteIsMuted(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_MUTED_MASK);
+}
+inline bool nodeInfoLiteIsKeyManuallyVerified(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK);
+}
+inline bool nodeInfoLiteHasXeddsaSigned(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK);
+}
+/// True if this node's snr_q4 was written from a genuine RF measurement (including a real
+/// 0 dB reading). False means "never measured" - do not treat 0 as data.
+inline bool nodeInfoLiteHasSnr(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HAS_SNR_MASK);
+}
+
+inline bool nodeInfoLiteHasRfHear(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HAS_RF_HEAR_MASK);
+}
+
+inline uint16_t nodeInfoLiteHeardSlot(const meshtastic_NodeInfoLite *n)
+{
+    return n ? (n->bitfield & NODEINFO_BITFIELD_HEARD_SLOT_MASK) >> NODEINFO_BITFIELD_HEARD_SLOT_SHIFT : 0;
+}
+
+/// Record that this node was just heard over RF on `slot`.
+inline void nodeInfoLiteSetHeardSlot(meshtastic_NodeInfoLite *n, uint16_t slot)
+{
+    if (!n)
+        return;
+    n->bitfield = (n->bitfield & ~NODEINFO_BITFIELD_HEARD_SLOT_MASK) |
+                  (((uint32_t)slot << NODEINFO_BITFIELD_HEARD_SLOT_SHIFT) & NODEINFO_BITFIELD_HEARD_SLOT_MASK) |
+                  NODEINFO_BITFIELD_HAS_RF_HEAR_MASK;
+}
+
+/// True iff this node was last heard over RF on the slot the radio is committed to right now.
+inline bool nodeInfoLiteHeardOnSlot(const meshtastic_NodeInfoLite *n, uint16_t committedSlot)
+{
+    return nodeInfoLiteHasRfHear(n) && nodeInfoLiteHeardSlot(n) == committedSlot;
+}
+/// A node that the eviction/migration paths must not drop: a favourite, an
+/// ignored (blocked) node, or a manually-verified key.
+inline bool nodeInfoLiteIsProtected(const meshtastic_NodeInfoLite *n)
+{
+    return nodeInfoLiteIsFavorite(n) || nodeInfoLiteIsIgnored(n) || nodeInfoLiteIsKeyManuallyVerified(n);
+}
+
+inline void nodeInfoLiteSetBit(meshtastic_NodeInfoLite *n, uint32_t mask, bool value)
+{
+    if (!n)
+        return;
+    if (value)
+        n->bitfield |= mask;
+    else
+        n->bitfield &= ~mask;
+}
+
+#define Module_Config_size                                                                                                       \
+    (ModuleConfig_CannedMessageConfig_size + ModuleConfig_ExternalNotificationConfig_size + ModuleConfig_MQTTConfig_size +       \
+     ModuleConfig_RangeTestConfig_size + ModuleConfig_SerialConfig_size + ModuleConfig_StoreForwardConfig_size +                 \
+     ModuleConfig_TelemetryConfig_size + ModuleConfig_size)
+
+// Please do not remove this comment, it makes trunk and compiler happy at the same time.
