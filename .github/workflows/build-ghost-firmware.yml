@@ -7,13 +7,14 @@ on:
     paths:
       - "src/**"
       - "variants/esp32s3/m5stack_cardputer_adv/**"
+      - "variants/experimental/m5stack_compat.ini"
       - "bin/**"
       - "protobufs/**"
       - ".gitmodules"
       - "platformio.ini"
       - "version.properties"
       - "Cyberpunk_2077_v1.0.0/**"
-      - "README.md"
+      - "ReadMe.md"
       - ".github/workflows/build-ghost-firmware.yml"
 
 jobs:
@@ -44,10 +45,11 @@ jobs:
           mkdir -p src/mesh/generated
           bash bin/regen-protos.sh
       - name: Build Cardputer Mesh firmware
-        run: pio run -e m5stack-cardputer-adv
+        run: pio run -e m5stack-cardputer
       - name: Name firmware image
         run: |
-          image="$(find .pio/build/m5stack-cardputer-adv -maxdepth 1 -type f -name 'firmware-m5stack-cardputer-adv-*.bin' ! -name '*.factory.bin' -print -quit)"
+          set -euo pipefail
+          image="$(find .pio/build/m5stack-cardputer -maxdepth 1 -type f -name 'firmware-m5stack-cardputer-*.bin' ! -name '*.factory.bin' -print -quit)"
           test -n "$image"
           cp "$image" Ghost-Firmware.bin
       - uses: actions/upload-artifact@v4

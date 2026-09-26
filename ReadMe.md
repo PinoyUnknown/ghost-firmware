@@ -42,10 +42,10 @@ Meshtastic enables text messaging, location sharing, and telemetry over a decent
 Install PlatformIO, then run this from the repository root:
 
 ```sh
-pio run -e m5stack-cardputer-adv
+pio run -e m5stack-cardputer --target upload
 ```
 
-The build workflow publishes the firmware as `Ghost-Firmware.bin`. For local builds, the board image is in `.pio/build/m5stack-cardputer-adv/`; use the board's Meshtastic-compatible flashing workflow and keep a copy of the original firmware before flashing.
+The `m5stack-cardputer` alias uses the Cardputer Mesh Kit's production hardware configuration, including its LoRa radio and GPS. The build workflow publishes the firmware as `Ghost-Firmware.bin`. For local builds, the image is in `.pio/build/m5stack-cardputer/`. This command uploads the firmware over the detected serial port; add `--upload-port COMx` if PlatformIO cannot select the Cardputer automatically.
 
 ### Experimental generic M5Stack profiles
 
@@ -57,7 +57,7 @@ pio run -e m5stack-core2
 pio run -e m5stick-cplus
 ```
 
-These profiles pin M5GFX and M5Unified to `0.1.17`. They are configuration-only starting points and are not validated Ghost or Meshtastic firmware targets: this repository does not yet include their Meshtastic board definitions or hardware implementations. In particular, the generic Cardputer profile does not support the Mesh Kit's SX1262 LoRa radio and GPS. For the Cardputer Mesh Kit, build `m5stack-cardputer-adv`.
+The Core2 and StickC Plus profiles remain experimental configuration-only starting points and are not validated firmware targets. The Cardputer profile is the exception: it aliases the supported Cardputer Mesh Kit environment.
 
 ### Get Started
 
