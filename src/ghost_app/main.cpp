@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <BLEDevice.h>
 #include <WiFi.h>
 #include <Wire.h>
 
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -61,6 +63,12 @@ struct AccessPoint
     wifi_auth_mode_t security;
 };
 
+struct BluetoothDevice
+{
+    char name[25];
+    int16_t rssi;
+};
+
 struct ThemeImage
 {
     const uint8_t *data;
@@ -86,18 +94,18 @@ constexpr std::array<ThemeImage, kThemeCount> themeImages = {{
 }};
 
 constexpr const char *featureDetails[kThemeCount] = {
-    "Connection tools unavailable",
-    "Device and module settings",
+    "Connection tools not implemented",
+    "Settings screen not implemented",
     "Cardputer uptime clock",
-    "Bluetooth feature status",
+    "Passive nearby BLE survey",
     "Passive nearby network survey",
-    "LoRa requires the Meshtastic app",
+    "LoRa radio module not configured",
     "External nRF24 module required",
     "External NFC module required",
-    "Device information and status",
+    "Device info screen not implemented",
     "No JavaScript runtime installed",
     "Infrared hardware support unavailable",
-    "GPS requires the Mesh Kit app",
+    "GPS support not configured",
     "External FM receiver required",
     "File browser support unavailable",
 };
@@ -136,8 +144,11 @@ class MemoryImageStream : public Stream
 };
 
 std::array<AccessPoint, 5> accessPoints{};
+std::array<BluetoothDevice, 5> bluetoothDevices{};
 size_t accessPointCount = 0;
+size_t bluetoothDeviceCount = 0;
 int16_t discoveredAccessPointCount = 0;
+int16_t discoveredBluetoothDeviceCount = 0;
 int16_t screenWidth = 240;
 int16_t screenHeight = 135;
 uint8_t selectedApp = 0;
@@ -146,6 +157,8 @@ Screen currentScreen = Screen::Home;
 bool keyboardReady = false;
 uint8_t keyboardAddress = kKeyboardAddress;
 bool scanFailed = false;
+bool bluetoothScanFailed = false;
+bool bluetoothReady = false;
 
 void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t width, int32_t height)
 {
@@ -273,6 +286,39 @@ void scanNearbyAccessPoints()
     }
 }
 
+void scanNearbyBluetoothDevices()
+{
+    bluetoothDeviceCount = 0;
+    discoveredBluetoothDeviceCount = 0;
+    bluetoothScanFailed = false;
+
+    if (!bluetoothReady) {
+        BLEDevice::init("");
+        bluetoothReady = BLEDevice::getInitialized();
+    }
+    BLEScan *scanner = bluetoothReady ? BLEDevice::getScan() : nullptr;
+    if (scanner == nullptr) {
+        bluetoothScanFailed = true;
+        return;
+    }
+
+    scanner->setActiveScan(false);
+    scanner->setInterval(100);
+    scanner->setWindow(50);
+    BLEScanResults results = scanner->start(3, false);
+    discoveredBluetoothDeviceCount = static_cast<int16_t>(results.getCount());
+    bluetoothDeviceCount =
+        std::min(static_cast<size_t>(discoveredBluetoothDeviceCount), bluetoothDevices.size());
+    for (size_t i = 0; i < bluetoothDeviceCount; ++i) {
+        BLEAdvertisedDevice device = results.getDevice(static_cast<uint32_t>(i));
+        const std::string name = device.getName();
+        BluetoothDevice &entry = bluetoothDevices[i];
+        strlcpy(entry.name, name.empty() ? "(unnamed)" : name.c_str(), sizeof(entry.name));
+        entry.rssi = static_cast<int16_t>(device.getRSSI());
+    }
+    scanner->clearResults();
+}
+
 void drawHome()
 {
     M5.Display.fillScreen(kBackgroundColor);
@@ -281,14 +327,41 @@ void drawHome()
     M5.Display.drawFastHLine(0, screenHeight - 25, screenWidth, kAccentColor);
     M5.Display.setTextDatum(textdatum_t::middle_center);
     M5.Display.setTextColor(kThemeColor, kBackgroundColor);
-    M5.Display.drawString(themeImages[selectedApp].name, screenWidth / 2, screenHeight - 19);
+    M5.Display.drawString(keyboardReady ? "W/S OR FN+ARROWS: MOVE" : "KEYBOARD NOT FOUND",
+                          screenWidth / 2, screenHeight - 19);
     M5.Display.setTextColor(kAccentColor, kBackgroundColor);
-    M5.Display.drawString(keyboardReady ? "W/S: BROWSE  ENTER: OPEN" : "KEYBOARD NOT FOUND",
-                          screenWidth / 2, screenHeight - 7);
+    M5.Display.drawString("ENTER / BtnA: OPEN", screenWidth / 2, screenHeight - 7);
 }
 
 void drawFeature()
 {
+    if (selectedApp == 3) {
+        drawThemeImage(selectedApp, 0, 0, screenWidth, 58);
+        M5.Display.fillRect(0, 58, screenWidth, screenHeight - 58, kBackgroundColor);
+        M5.Display.setTextDatum(textdatum_t::top_left);
+        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+        char line[48];
+        if (bluetoothScanFailed) {
+            M5.Display.drawString("BLE survey unavailable", 5, 63);
+        } else {
+            snprintf(line, sizeof(line), "NEARBY BLE: %d", discoveredBluetoothDeviceCount);
+            M5.Display.drawString(line, 5, 60);
+            for (size_t i = 0; i < bluetoothDeviceCount && i < 3; ++i) {
+                const BluetoothDevice &device = bluetoothDevices[i];
+                snprintf(line, sizeof(line), "%.22s %ddBm", device.name, device.rssi);
+                M5.Display.drawString(line, 5, 73 + static_cast<int16_t>(i) * 13);
+            }
+            if (discoveredBluetoothDeviceCount == 0) {
+                M5.Display.drawString("No advertisers found", 5, 73);
+            }
+        }
+        M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
+        M5.Display.setTextColor(kAccentColor, kBackgroundColor);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.drawString("R/ENTER/BtnA: SCAN  ESC: BACK", screenWidth / 2, screenHeight - 6);
+        return;
+    }
+
     if (selectedApp == 4) {
         drawThemeImage(selectedApp, 0, 0, screenWidth, 58);
         M5.Display.fillRect(0, 58, screenWidth, screenHeight - 58, kBackgroundColor);
@@ -313,7 +386,7 @@ void drawFeature()
         M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
         M5.Display.setTextColor(kAccentColor, kBackgroundColor);
         M5.Display.setTextDatum(textdatum_t::middle_center);
-        M5.Display.drawString("R/ENTER: RESCAN  ESC: BACK", screenWidth / 2, screenHeight - 6);
+        M5.Display.drawString("R/ENTER/BtnA: RESCAN  ESC: BACK", screenWidth / 2, screenHeight - 6);
         return;
     }
 
@@ -347,7 +420,9 @@ void redrawScreen()
 void openSelectedApp()
 {
     currentScreen = Screen::Feature;
-    if (selectedApp == 4) {
+    if (selectedApp == 3) {
+        scanNearbyBluetoothDevices();
+    } else if (selectedApp == 4) {
         scanNearbyAccessPoints();
     }
 }
@@ -366,8 +441,13 @@ void handleKey(uint8_t key)
         } else if (key == kKeySelect || key == '\n' || key == ' ') {
             openSelectedApp();
         }
-    } else if (selectedApp == 4 && (key == 'r' || key == 'R' || key == kKeySelect)) {
-        scanNearbyAccessPoints();
+    } else if ((selectedApp == 3 || selectedApp == 4) &&
+               (key == 'r' || key == 'R' || key == kKeySelect)) {
+        if (selectedApp == 3) {
+            scanNearbyBluetoothDevices();
+        } else {
+            scanNearbyAccessPoints();
+        }
     }
 
     if (key == kKeyEscape || key == kKeyBackspace) {
@@ -483,6 +563,8 @@ void loop()
     if (M5.BtnA.wasPressed()) {
         if (currentScreen == Screen::Home) {
             openSelectedApp();
+        } else if (selectedApp == 3) {
+            scanNearbyBluetoothDevices();
         } else if (selectedApp == 4) {
             scanNearbyAccessPoints();
         } else {
