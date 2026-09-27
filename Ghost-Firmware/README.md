@@ -1,22 +1,24 @@
-# Ghost-Firmware.bin
+# Ghost Firmware for M5Stack Cardputer
 
-This directory contains the download and flashing instructions for the standalone Ghost firmware for the M5Stack Cardputer. It is separate from the Meshtastic firmware and does not provide LoRa or Meshtastic messaging.
+This is a standalone ESP32-S3 application with a Cyberpunk-themed, keyboard-navigable menu and an animated Ghost splash screen labeled “PinoyUnknown.” The 14 theme images are scaled proportionally to fit the Cardputer's 240×135 display.
 
-The app uses the Cyberpunk-inspired colors from `Cyberpunk_2077_v1.0.0/Cyberpunk 2077.json`, shows the Ghost splash screen, and provides a passive Wi-Fi survey. The survey lists nearby broadcast network names, signal strength, channel, and security mode; it does not connect to networks or transmit Wi-Fi management frames.
+Use the built-in keyboard arrow keys or W/S to browse the CONNECT, CONFIG, CLOCK, BLE, WIFI, RF, NRF, NFC, MISC, JS, IR, GPS, FM, and FILE screens. Press Enter to open a screen and Esc or Backspace to return. The Clock shows uptime. WIFI performs a receive-only scan of nearby access points; press R or Enter to rescan. Cardputer button A opens the selected screen and returns from feature screens.
+
+The other category screens currently show their theme art and status text only; they do not imply the corresponding external radios, NFC readers, GPS, infrared, Bluetooth, JavaScript, or file-browser functions are implemented. This standalone app does not provide Meshtastic or LoRa messaging.
 
 ## Download
 
-The GitHub Actions build publishes `Ghost-Firmware.bin` as a downloadable artifact:
+GitHub Actions publishes `Ghost-Firmware.bin` as a build artifact:
 
 1. Open the [Ghost Firmware build workflow](https://github.com/PinoyUnknown/ghost-firmware/actions/workflows/build-ghost-firmware.yml).
 2. Select the latest successful run.
 3. Download the **Ghost-Firmware** artifact and extract `Ghost-Firmware.bin`.
 
-Published GitHub releases will also include the binary.
+Published GitHub releases also include the binary.
 
 ## Flash
 
-`Ghost-Firmware.bin` is a merged ESP32-S3 image containing the bootloader, partition table, and app. With Espressif esptool installed, connect the Cardputer in download mode and run:
+`Ghost-Firmware.bin` is a merged ESP32-S3 image containing the bootloader, partition table, and application. With Espressif esptool installed, connect the Cardputer in download mode and run:
 
 ```sh
 python -m esptool --chip esp32s3 --port COMx --baud 1500000 write_flash 0x0 Ghost-Firmware.bin

@@ -17,7 +17,8 @@
         "ms-vscode.cpptools",
         "Jason2866.esp-decoder",
         "pioarduino.pioarduino-ide",
-        "Trunk.io"
+        "Trunk.io",
+        "platformio.platformio-ide"
       ],
       "unwantedRecommendations": [
         "ms-azuretools.vscode-docker",
