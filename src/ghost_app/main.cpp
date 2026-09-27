@@ -2,6 +2,10 @@
 #include <BLEDevice.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <SPIFFS.h>
+#include <esp_sntp.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "theme_assets.h"
 
@@ -36,6 +40,9 @@ constexpr uint8_t kKeyFunction = 0x02;
 constexpr uint8_t kKeyboardRows = 7;
 constexpr uint8_t kKeyboardColumns = 8;
 constexpr uint8_t kThemeCount = 14;
+constexpr size_t kMaxSurveyResults = 64;
+constexpr size_t kVisibleResults = 5;
+constexpr size_t kMaxFileEntries = 64;
 
 constexpr uint8_t kKeyMap[56][3] = {
     {'`', '~', kKeyEscape}, {'\t', 0, 0},                         {0, 0, 0},             {0, 0, 0},
@@ -53,20 +60,33 @@ constexpr uint8_t kKeyMap[56][3] = {
     {'=', '+', 0},           {']', '}', 0},                       {'\'', '"', 0},        {'/', '?', kKeyRight},
     {kKeyBackspace, 0, 0},   {'\\', '|', 0},                      {kKeySelect, 0, 0},     {' ', ' ', ' '}};
 
-enum class Screen : uint8_t { Home, Feature };
+enum class Screen : uint8_t { Home, Feature, SurveyDetail, FilePreview };
 
 struct AccessPoint
 {
-    char ssid[25];
+    char ssid[33];
     int16_t rssi;
     uint8_t channel;
     wifi_auth_mode_t security;
+    char bssid[18];
 };
 
 struct BluetoothDevice
 {
     char name[25];
+    char address[18];
+    char firstServiceUuid[37];
+    uint16_t serviceCount;
+    uint16_t manufacturerDataBytes;
     int16_t rssi;
+};
+
+struct FileEntry
+{
+    char name[48];
+    char path[96];
+    uint32_t size;
+    bool isDirectory;
 };
 
 struct ThemeImage
@@ -143,22 +163,38 @@ class MemoryImageStream : public Stream
     size_t position = 0;
 };
 
-std::array<AccessPoint, 5> accessPoints{};
-std::array<BluetoothDevice, 5> bluetoothDevices{};
+std::array<AccessPoint, kMaxSurveyResults> accessPoints{};
+std::array<BluetoothDevice, kMaxSurveyResults> bluetoothDevices{};
+std::array<FileEntry, kMaxFileEntries> fileEntries{};
 size_t accessPointCount = 0;
 size_t bluetoothDeviceCount = 0;
+size_t fileEntryCount = 0;
 int16_t discoveredAccessPointCount = 0;
 int16_t discoveredBluetoothDeviceCount = 0;
 int16_t screenWidth = 240;
 int16_t screenHeight = 135;
 uint8_t selectedApp = 0;
 uint8_t keyboardModifiers = 0;
+size_t selectedResult = 0;
+size_t selectedFile = 0;
+String currentDirectory = "/";
+String manualTimeDigits;
+String previewPath;
+size_t previewLineOffset = 0;
 Screen currentScreen = Screen::Home;
 bool keyboardReady = false;
 uint8_t keyboardAddress = kKeyboardAddress;
 bool scanFailed = false;
 bool bluetoothScanFailed = false;
 bool bluetoothReady = false;
+bool filesystemReady = false;
+bool fileListingFailed = false;
+bool manualTimeEntry = false;
+bool clockSyncFailed = false;
+bool clockSyncInProgress = false;
+bool clockSynced = false;
+bool clockSetFailed = false;
+time_t clockDisplaySecond = 0;
 
 void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t width, int32_t height)
 {
@@ -277,6 +313,8 @@ void scanNearbyAccessPoints()
             entry.rssi = static_cast<int16_t>(WiFi.RSSI(static_cast<int>(i)));
             entry.channel = static_cast<uint8_t>(WiFi.channel(static_cast<int>(i)));
             entry.security = WiFi.encryptionType(static_cast<int>(i));
+            const String bssid = WiFi.BSSIDstr(static_cast<int>(i));
+            strlcpy(entry.bssid, bssid.c_str(), sizeof(entry.bssid));
         }
     }
 
@@ -314,9 +352,151 @@ void scanNearbyBluetoothDevices()
         const std::string name = device.getName();
         BluetoothDevice &entry = bluetoothDevices[i];
         strlcpy(entry.name, name.empty() ? "(unnamed)" : name.c_str(), sizeof(entry.name));
+        const std::string address = device.getAddress().toString();
+        strlcpy(entry.address, address.c_str(), sizeof(entry.address));
+        entry.serviceCount = static_cast<uint16_t>(device.getServiceUUIDCount());
+        entry.firstServiceUuid[0] = '\0';
+        if (entry.serviceCount > 0) {
+            const std::string service = device.getServiceUUID(0).toString();
+            strlcpy(entry.firstServiceUuid, service.c_str(), sizeof(entry.firstServiceUuid));
+        }
+        entry.manufacturerDataBytes = static_cast<uint16_t>(device.getManufacturerData().size());
         entry.rssi = static_cast<int16_t>(device.getRSSI());
     }
     scanner->clearResults();
+}
+
+void loadFileList()
+{
+    fileEntryCount = 0;
+    selectedFile = 0;
+    fileListingFailed = false;
+    if (!filesystemReady) {
+        filesystemReady = SPIFFS.begin(false);
+    }
+    if (!filesystemReady) {
+        fileListingFailed = true;
+        return;
+    }
+
+    if (currentDirectory != "/" && fileEntryCount < fileEntries.size()) {
+        FileEntry &parent = fileEntries[fileEntryCount++];
+        strlcpy(parent.name, "..", sizeof(parent.name));
+        const int lastSlash = currentDirectory.lastIndexOf('/');
+        const String parentPath = currentDirectory.substring(0, lastSlash);
+        strlcpy(parent.path, parentPath.c_str(), sizeof(parent.path));
+        if (parent.path[0] == '\0') {
+            strlcpy(parent.path, "/", sizeof(parent.path));
+        }
+        parent.size = 0;
+        parent.isDirectory = true;
+    }
+
+    File directory = SPIFFS.open(currentDirectory.c_str(), FILE_READ);
+    if (!directory || !directory.isDirectory()) {
+        fileListingFailed = true;
+        return;
+    }
+
+    File entry = directory.openNextFile();
+    while (entry && fileEntryCount < fileEntries.size()) {
+        FileEntry &item = fileEntries[fileEntryCount++];
+        const char *path = entry.name();
+        const char *name = strrchr(path, '/');
+        name = name == nullptr ? path : name + 1;
+        strlcpy(item.name, name, sizeof(item.name));
+        strlcpy(item.path, path, sizeof(item.path));
+        item.size = static_cast<uint32_t>(entry.size());
+        item.isDirectory = entry.isDirectory();
+        entry.close();
+        entry = directory.openNextFile();
+    }
+    directory.close();
+}
+
+void beginManualTimeEntry()
+{
+    manualTimeDigits = "";
+    manualTimeEntry = true;
+    clockSetFailed = false;
+}
+
+void saveManualTime()
+{
+    if (manualTimeDigits.length() != 14) {
+        clockSetFailed = true;
+        return;
+    }
+
+    struct tm value = {};
+    value.tm_year = manualTimeDigits.substring(0, 4).toInt() - 1900;
+    value.tm_mon = manualTimeDigits.substring(4, 6).toInt() - 1;
+    value.tm_mday = manualTimeDigits.substring(6, 8).toInt();
+    value.tm_hour = manualTimeDigits.substring(8, 10).toInt();
+    value.tm_min = manualTimeDigits.substring(10, 12).toInt();
+    value.tm_sec = manualTimeDigits.substring(12, 14).toInt();
+    if (value.tm_year < 124 || value.tm_mon < 0 || value.tm_mon > 11 || value.tm_mday < 1 ||
+        value.tm_mday > 31 || value.tm_hour > 23 || value.tm_min > 59 || value.tm_sec > 59) {
+        clockSetFailed = true;
+        return;
+    }
+
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    const int expectedYear = value.tm_year;
+    const int expectedMonth = value.tm_mon;
+    const int expectedDay = value.tm_mday;
+    const time_t epoch = mktime(&value);
+    struct tm verified = {};
+    gmtime_r(&epoch, &verified);
+    if (verified.tm_year != expectedYear || verified.tm_mon != expectedMonth ||
+        verified.tm_mday != expectedDay) {
+        clockSetFailed = true;
+        return;
+    }
+
+    struct timeval now = {};
+    now.tv_sec = epoch;
+    now.tv_usec = 0;
+    if (settimeofday(&now, nullptr) != 0) {
+        clockSetFailed = true;
+        return;
+    }
+    manualTimeEntry = false;
+    manualTimeDigits = "";
+    clockSynced = false;
+    clockSetFailed = false;
+}
+
+void syncClockFromNetwork()
+{
+    clockSyncInProgress = true;
+    clockSyncFailed = false;
+    const wifi_mode_t previousMode = WiFi.getMode();
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.mode(WIFI_MODE_STA);
+        WiFi.begin();
+    }
+
+    sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm current = {};
+    bool synced = false;
+    for (uint8_t attempt = 0; attempt < 48; ++attempt) {
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED && getLocalTime(&current, 100) &&
+            current.tm_year >= 124) {
+            synced = true;
+            break;
+        }
+        delay(250);
+    }
+    clockSynced = synced;
+    clockSyncFailed = !synced;
+    clockSyncInProgress = false;
+    if (previousMode == WIFI_MODE_NULL && WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect(false, false);
+        WiFi.mode(WIFI_MODE_NULL);
+    }
 }
 
 void drawHome()
@@ -333,125 +513,383 @@ void drawHome()
     M5.Display.drawString("ENTER / BtnA: OPEN", screenWidth / 2, screenHeight - 7);
 }
 
+void drawFooter(const char *text)
+{
+    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
+    M5.Display.setTextColor(kAccentColor, kBackgroundColor);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString(text, screenWidth / 2, screenHeight - 6);
+}
+
+void drawBluetoothSurvey()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    char line[48];
+    if (bluetoothScanFailed) {
+        M5.Display.drawString("BLE survey unavailable", 5, 5);
+        return;
+    }
+    snprintf(line, sizeof(line), "BLE ADVERTISERS: %d  SHOWING %u", discoveredBluetoothDeviceCount,
+             static_cast<unsigned>(bluetoothDeviceCount));
+    M5.Display.drawString(line, 5, 4);
+    if (bluetoothDeviceCount == 0) {
+        M5.Display.drawString("No advertisers found", 5, 27);
+        return;
+    }
+    const size_t first = selectedResult >= kVisibleResults ? selectedResult - kVisibleResults + 1 : 0;
+    for (size_t row = 0; row < kVisibleResults && first + row < bluetoothDeviceCount; ++row) {
+        const size_t index = first + row;
+        const BluetoothDevice &device = bluetoothDevices[index];
+        const int16_t y = 21 + static_cast<int16_t>(row) * 19;
+        if (index == selectedResult) {
+            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
+        } else {
+            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+        }
+        snprintf(line, sizeof(line), "%.17s %ddBm", device.name, device.rssi);
+        M5.Display.drawString(line, 5, y);
+    }
+}
+
+void drawWifiSurvey()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    char line[52];
+    if (scanFailed) {
+        M5.Display.drawString("Wi-Fi survey unavailable", 5, 5);
+        return;
+    }
+    snprintf(line, sizeof(line), "NETWORKS: %d  SHOWING %u", discoveredAccessPointCount,
+             static_cast<unsigned>(accessPointCount));
+    M5.Display.drawString(line, 5, 4);
+    if (accessPointCount == 0) {
+        M5.Display.drawString("No networks found", 5, 27);
+        return;
+    }
+    const size_t first = selectedResult >= kVisibleResults ? selectedResult - kVisibleResults + 1 : 0;
+    for (size_t row = 0; row < kVisibleResults && first + row < accessPointCount; ++row) {
+        const size_t index = first + row;
+        const AccessPoint &network = accessPoints[index];
+        const int16_t y = 21 + static_cast<int16_t>(row) * 19;
+        if (index == selectedResult) {
+            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
+        } else {
+            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+        }
+        snprintf(line, sizeof(line), "%.14s %4ddBm C%02u %s", network.ssid, network.rssi, network.channel,
+                 securityName(network.security));
+        M5.Display.drawString(line, 5, y);
+    }
+}
+
+void drawSurveyDetail()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    char line[52];
+    if (selectedApp == 4 && selectedResult < accessPointCount) {
+        const AccessPoint &network = accessPoints[selectedResult];
+        M5.Display.drawString("WI-FI ACCESS POINT", 5, 5);
+        snprintf(line, sizeof(line), "SSID: %.30s", network.ssid);
+        M5.Display.drawString(line, 5, 26);
+        snprintf(line, sizeof(line), "BSSID: %s", network.bssid);
+        M5.Display.drawString(line, 5, 44);
+        snprintf(line, sizeof(line), "RSSI: %d dBm  CHANNEL: %u", network.rssi, network.channel);
+        M5.Display.drawString(line, 5, 62);
+        snprintf(line, sizeof(line), "SECURITY: %s", securityName(network.security));
+        M5.Display.drawString(line, 5, 80);
+        M5.Display.drawString("Passive beacon scan; no connection", 5, 99);
+    } else if (selectedApp == 3 && selectedResult < bluetoothDeviceCount) {
+        const BluetoothDevice &device = bluetoothDevices[selectedResult];
+        M5.Display.drawString("BLE ADVERTISEMENT", 5, 5);
+        snprintf(line, sizeof(line), "NAME: %.30s", device.name);
+        M5.Display.drawString(line, 5, 26);
+        snprintf(line, sizeof(line), "ADDRESS: %s", device.address);
+        M5.Display.drawString(line, 5, 44);
+        snprintf(line, sizeof(line), "RSSI: %d dBm", device.rssi);
+        M5.Display.drawString(line, 5, 62);
+        snprintf(line, sizeof(line), "SERVICES: %u  MFG DATA: %uB", device.serviceCount,
+                 device.manufacturerDataBytes);
+        M5.Display.drawString(line, 5, 80);
+        snprintf(line, sizeof(line), "UUID: %.32s", device.firstServiceUuid[0] ? device.firstServiceUuid : "none");
+        M5.Display.drawString(line, 5, 98);
+    }
+    drawFooter("ESC: BACK");
+}
+
+void drawClock()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    M5.Display.drawString("UTC CLOCK", 5, 5);
+    if (manualTimeEntry) {
+        M5.Display.drawString("SET YYYYMMDDhhmmss:", 5, 30);
+        M5.Display.drawString(manualTimeDigits.c_str(), 5, 53);
+        M5.Display.drawString("14 digits, ENTER saves", 5, 76);
+        M5.Display.drawString("BACKSPACE edits", 5, 94);
+        if (clockSetFailed) {
+            M5.Display.drawString("Invalid date/time", 5, 111);
+        }
+    } else {
+        const time_t now = time(nullptr);
+        struct tm value = {};
+        char line[48];
+        if (now >= 1700000000 && gmtime_r(&now, &value) != nullptr) {
+            strftime(line, sizeof(line), "%Y-%m-%d", &value);
+            M5.Display.drawString(line, 5, 34);
+            strftime(line, sizeof(line), "%H:%M:%S UTC", &value);
+            M5.Display.drawString(line, 5, 55);
+            snprintf(line, sizeof(line), "SOURCE: %s", clockSynced ? "NTP" : "MANUAL/RTC");
+            M5.Display.drawString(line, 5, 78);
+        } else {
+            M5.Display.drawString("Time not set", 5, 34);
+        }
+        if (clockSyncInProgress) {
+            M5.Display.drawString("Syncing network time...", 5, 98);
+        } else if (clockSyncFailed) {
+            M5.Display.drawString("NTP failed; check saved Wi-Fi", 5, 98);
+        } else {
+            M5.Display.drawString("N: NTP SYNC  M: SET TIME", 5, 98);
+        }
+    }
+    drawFooter("ESC: BACK");
+}
+
+void drawFileBrowser()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    char heading[52];
+    snprintf(heading, sizeof(heading), "FLASH:%s", currentDirectory.c_str());
+    M5.Display.drawString(heading, 5, 4);
+    if (fileListingFailed) {
+        M5.Display.drawString("Flash filesystem unavailable", 5, 28);
+        return;
+    }
+    if (fileEntryCount == 0) {
+        M5.Display.drawString("Folder is empty", 5, 28);
+        return;
+    }
+    const size_t first = selectedFile >= kVisibleResults ? selectedFile - kVisibleResults + 1 : 0;
+    for (size_t row = 0; row < kVisibleResults && first + row < fileEntryCount; ++row) {
+        const size_t index = first + row;
+        const FileEntry &entry = fileEntries[index];
+        const int16_t y = 21 + static_cast<int16_t>(row) * 19;
+        if (index == selectedFile) {
+            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
+        } else {
+            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+        }
+        if (entry.isDirectory) {
+            snprintf(heading, sizeof(heading), "[DIR] %.38s", entry.name);
+        } else {
+            snprintf(heading, sizeof(heading), "%.31s %luB", entry.name, static_cast<unsigned long>(entry.size));
+        }
+        M5.Display.drawString(heading, 5, y);
+    }
+}
+
+void drawFilePreview()
+{
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+    M5.Display.drawString(previewPath.substring(previewPath.lastIndexOf('/') + 1).c_str(), 5, 4);
+    File file = SPIFFS.open(previewPath.c_str(), FILE_READ);
+    if (!file || file.isDirectory()) {
+        M5.Display.drawString("Unable to read file", 5, 27);
+        return;
+    }
+    for (size_t skipped = 0; skipped < previewLineOffset && file.available(); ++skipped) {
+        file.readStringUntil('\n');
+    }
+    for (uint8_t row = 0; row < kVisibleResults && file.available(); ++row) {
+        String text = file.readStringUntil('\n');
+        text.trim();
+        M5.Display.drawString(text.substring(0, 38).c_str(), 5, 22 + row * 19);
+    }
+    file.close();
+}
+
 void drawFeature()
 {
     if (selectedApp == 3) {
-        drawThemeImage(selectedApp, 0, 0, screenWidth, 58);
-        M5.Display.fillRect(0, 58, screenWidth, screenHeight - 58, kBackgroundColor);
-        M5.Display.setTextDatum(textdatum_t::top_left);
-        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
-        char line[48];
-        if (bluetoothScanFailed) {
-            M5.Display.drawString("BLE survey unavailable", 5, 63);
-        } else {
-            snprintf(line, sizeof(line), "NEARBY BLE: %d", discoveredBluetoothDeviceCount);
-            M5.Display.drawString(line, 5, 60);
-            for (size_t i = 0; i < bluetoothDeviceCount && i < 3; ++i) {
-                const BluetoothDevice &device = bluetoothDevices[i];
-                snprintf(line, sizeof(line), "%.22s %ddBm", device.name, device.rssi);
-                M5.Display.drawString(line, 5, 73 + static_cast<int16_t>(i) * 13);
-            }
-            if (discoveredBluetoothDeviceCount == 0) {
-                M5.Display.drawString("No advertisers found", 5, 73);
-            }
-        }
-        M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
-        M5.Display.setTextColor(kAccentColor, kBackgroundColor);
-        M5.Display.setTextDatum(textdatum_t::middle_center);
-        M5.Display.drawString("R/ENTER/BtnA: SCAN  ESC: BACK", screenWidth / 2, screenHeight - 6);
-        return;
-    }
-
-    if (selectedApp == 4) {
-        drawThemeImage(selectedApp, 0, 0, screenWidth, 58);
-        M5.Display.fillRect(0, 58, screenWidth, screenHeight - 58, kBackgroundColor);
-        M5.Display.setTextDatum(textdatum_t::top_left);
-        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
-        char line[52];
-        if (scanFailed) {
-            M5.Display.drawString("Wi-Fi survey unavailable", 5, 63);
-        } else {
-            snprintf(line, sizeof(line), "NEARBY NETWORKS: %d", discoveredAccessPointCount);
-            M5.Display.drawString(line, 5, 60);
-            for (size_t i = 0; i < accessPointCount && i < 3; ++i) {
-                const AccessPoint &entry = accessPoints[i];
-                snprintf(line, sizeof(line), "%.17s %ddBm CH%u %s", entry.ssid, entry.rssi, entry.channel,
-                         securityName(entry.security));
-                M5.Display.drawString(line, 5, 73 + static_cast<int16_t>(i) * 13);
-            }
-            if (discoveredAccessPointCount == 0) {
-                M5.Display.drawString("No networks found", 5, 73);
-            }
-        }
-        M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
-        M5.Display.setTextColor(kAccentColor, kBackgroundColor);
-        M5.Display.setTextDatum(textdatum_t::middle_center);
-        M5.Display.drawString("R/ENTER/BtnA: RESCAN  ESC: BACK", screenWidth / 2, screenHeight - 6);
-        return;
-    }
-
-    drawThemeImage(selectedApp, 0, 0, screenWidth, screenHeight - 29);
-    M5.Display.fillRect(0, screenHeight - 29, screenWidth, 29, kBackgroundColor);
-    M5.Display.drawFastHLine(0, screenHeight - 29, screenWidth, kAccentColor);
-    M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
-    M5.Display.drawString(themeImages[selectedApp].name, screenWidth / 2, screenHeight - 22);
-    M5.Display.setTextColor(kAccentColor, kBackgroundColor);
-    if (selectedApp == 2) {
-        const uint32_t seconds = millis() / 1000;
-        char line[52];
-        snprintf(line, sizeof(line), "UPTIME %02lu:%02lu:%02lu  |  Esc: back", seconds / 3600,
-                 seconds / 60 % 60, seconds % 60);
-        M5.Display.drawString(line, screenWidth / 2, screenHeight - 7);
+        drawBluetoothSurvey();
+        drawFooter("W/S: SELECT  ENTER: DETAILS  R: RESCAN");
+    } else if (selectedApp == 4) {
+        drawWifiSurvey();
+        drawFooter("W/S: SELECT  ENTER: DETAILS  R: RESCAN");
+    } else if (selectedApp == 2) {
+        drawClock();
+    } else if (selectedApp == 13) {
+        drawFileBrowser();
+        drawFooter("W/S: SELECT  ENTER: OPEN  ESC: BACK");
     } else {
-        M5.Display.drawString(featureDetails[selectedApp], screenWidth / 2, screenHeight - 7);
+        M5.Display.setTextDatum(textdatum_t::top_left);
+        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+        M5.Display.drawString(themeImages[selectedApp].name, 5, 5);
+        M5.Display.drawString(featureDetails[selectedApp], 5, 30);
+        if (selectedApp == 5 || selectedApp == 6 || selectedApp == 7 || selectedApp == 10 ||
+            selectedApp == 11 || selectedApp == 12) {
+            M5.Display.drawString("Required external hardware is not", 5, 52);
+            M5.Display.drawString("configured in this Cardputer build.", 5, 68);
+        } else if (selectedApp == 8) {
+            M5.Display.drawString("Available: passive Wi-Fi / BLE surveys,", 5, 52);
+            M5.Display.drawString("UTC clock, and flash file browser.", 5, 68);
+        }
+        drawFooter("ESC / BACKSPACE: BACK");
     }
 }
 
 void redrawScreen()
 {
+    M5.Display.fillScreen(kBackgroundColor);
     if (currentScreen == Screen::Home) {
         drawHome();
+    } else if (currentScreen == Screen::SurveyDetail) {
+        drawSurveyDetail();
+    } else if (currentScreen == Screen::FilePreview) {
+        drawFilePreview();
+        drawFooter("W/S: SCROLL  ESC: FILES");
     } else {
         drawFeature();
+    }
+}
+
+void openSelectedFile()
+{
+    if (selectedFile >= fileEntryCount) {
+        return;
+    }
+    const FileEntry &entry = fileEntries[selectedFile];
+    if (entry.isDirectory) {
+        currentDirectory = entry.path;
+        loadFileList();
+    } else {
+        previewPath = entry.path;
+        previewLineOffset = 0;
+        currentScreen = Screen::FilePreview;
     }
 }
 
 void openSelectedApp()
 {
     currentScreen = Screen::Feature;
-    if (selectedApp == 3) {
+    selectedResult = 0;
+    if (selectedApp == 2) {
+        clockSyncFailed = false;
+        manualTimeEntry = false;
+        clockDisplaySecond = 0;
+    } else if (selectedApp == 3) {
         scanNearbyBluetoothDevices();
     } else if (selectedApp == 4) {
         scanNearbyAccessPoints();
+    } else if (selectedApp == 13) {
+        currentDirectory = "/";
+        loadFileList();
+    }
+}
+
+void handleFeatureKey(uint8_t key)
+{
+    if (manualTimeEntry) {
+        if (key == kKeyEscape) {
+            manualTimeEntry = false;
+            manualTimeDigits = "";
+        } else if (key >= '0' && key <= '9' && manualTimeDigits.length() < 14) {
+            manualTimeDigits += static_cast<char>(key);
+        } else if (key == kKeyBackspace && !manualTimeDigits.isEmpty()) {
+            manualTimeDigits.remove(manualTimeDigits.length() - 1);
+        } else if (key == kKeySelect || key == '\n') {
+            saveManualTime();
+        }
+        return;
+    }
+
+    if (currentScreen == Screen::SurveyDetail) {
+        if (key == kKeyEscape || key == kKeyBackspace) {
+            currentScreen = Screen::Feature;
+        }
+        return;
+    }
+
+    if (currentScreen == Screen::FilePreview) {
+        if (key == kKeyDown || key == 's') {
+            File file = SPIFFS.open(previewPath.c_str(), FILE_READ);
+            size_t lineCount = 0;
+            while (file && file.available()) {
+                file.readStringUntil('\n');
+                ++lineCount;
+            }
+            if (lineCount > previewLineOffset + kVisibleResults) {
+                ++previewLineOffset;
+            }
+        } else if ((key == kKeyUp || key == 'w') && previewLineOffset > 0) {
+            --previewLineOffset;
+        } else if (key == kKeyEscape || key == kKeyBackspace) {
+            currentScreen = Screen::Feature;
+        }
+        return;
+    }
+
+    if (selectedApp == 3 || selectedApp == 4) {
+        const size_t resultCount = selectedApp == 3 ? bluetoothDeviceCount : accessPointCount;
+        if ((key == kKeyUp || key == 'w') && selectedResult > 0) {
+            --selectedResult;
+        } else if ((key == kKeyDown || key == 's') && selectedResult + 1 < resultCount) {
+            ++selectedResult;
+        } else if (key == 'r' || key == 'R') {
+            selectedResult = 0;
+            selectedApp == 3 ? scanNearbyBluetoothDevices() : scanNearbyAccessPoints();
+        } else if ((key == kKeySelect || key == '\n') && resultCount > 0) {
+            currentScreen = Screen::SurveyDetail;
+        }
+    } else if (selectedApp == 2) {
+        if (key == 'n' || key == 'N') {
+            syncClockFromNetwork();
+        } else if (key == 'm' || key == 'M') {
+            beginManualTimeEntry();
+        }
+    } else if (selectedApp == 13) {
+        if ((key == kKeyUp || key == 'w') && selectedFile > 0) {
+            --selectedFile;
+        } else if ((key == kKeyDown || key == 's') && selectedFile + 1 < fileEntryCount) {
+            ++selectedFile;
+        } else if (key == kKeySelect || key == '\n') {
+            openSelectedFile();
+        }
+    }
+
+    if (key == kKeyEscape || key == kKeyBackspace) {
+        if (selectedApp == 13 && currentDirectory != "/") {
+            const int lastSlash = currentDirectory.lastIndexOf('/');
+            currentDirectory = currentDirectory.substring(0, lastSlash);
+            if (currentDirectory.isEmpty()) {
+                currentDirectory = "/";
+            }
+            loadFileList();
+        } else {
+            currentScreen = Screen::Home;
+        }
     }
 }
 
 void handleKey(uint8_t key)
 {
     if (currentScreen == Screen::Home) {
-        if (key == kKeyUp || key == 'w') {
+        if (key == kKeyUp || key == 'w' || key == kKeyLeft) {
             selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
-        } else if (key == kKeyDown || key == 's') {
-            selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
-        } else if (key == kKeyLeft) {
-            selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
-        } else if (key == kKeyRight) {
+        } else if (key == kKeyDown || key == 's' || key == kKeyRight) {
             selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
         } else if (key == kKeySelect || key == '\n' || key == ' ') {
             openSelectedApp();
         }
-    } else if ((selectedApp == 3 || selectedApp == 4) &&
-               (key == 'r' || key == 'R' || key == kKeySelect)) {
-        if (selectedApp == 3) {
-            scanNearbyBluetoothDevices();
-        } else {
-            scanNearbyAccessPoints();
-        }
-    }
-
-    if (key == kKeyEscape || key == kKeyBackspace) {
-        currentScreen = Screen::Home;
+    } else {
+        handleFeatureKey(key);
     }
     redrawScreen();
 }
@@ -563,14 +1001,17 @@ void loop()
     if (M5.BtnA.wasPressed()) {
         if (currentScreen == Screen::Home) {
             openSelectedApp();
-        } else if (selectedApp == 3) {
-            scanNearbyBluetoothDevices();
-        } else if (selectedApp == 4) {
-            scanNearbyAccessPoints();
         } else {
-            currentScreen = Screen::Home;
+            handleFeatureKey(kKeySelect);
         }
         redrawScreen();
+    }
+    if (currentScreen == Screen::Feature && selectedApp == 2 && !manualTimeEntry) {
+        const time_t currentSecond = time(nullptr);
+        if (currentSecond != clockDisplaySecond) {
+            clockDisplaySecond = currentSecond;
+            redrawScreen();
+        }
     }
     delay(10);
 }
