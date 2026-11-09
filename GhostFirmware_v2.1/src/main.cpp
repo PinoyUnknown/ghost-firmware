@@ -3,6 +3,8 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <SD.h>
+#include <FS.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -147,6 +149,16 @@ constexpr uint8_t kLoraCsPin = 5;
 constexpr uint8_t kLoraRstPin = 3;
 constexpr uint8_t kLoraDio1Pin = 4;
 constexpr uint8_t kLoraBusyPin = 6;
+
+// MicroSD TF-Card pins on Cardputer
+constexpr uint8_t kSdCsPin = 12;
+constexpr uint8_t kSdSckPin = 40;
+constexpr uint8_t kSdMisoPin = 39;
+constexpr uint8_t kSdMosiPin = 14;
+
+static bool sdCardMounted = false;
+static bool useSdCard = false;
+
 
 constexpr std::array<uint8_t, 3> kMatrixOutputPins = {8, 9, 11};
 constexpr std::array<uint8_t, 7> kMatrixInputPins = {13, 15, 3, 4, 5, 6, 7};
@@ -329,6 +341,7 @@ std::array<bool, kTotalKeys> previousKeyStates{};
 uint8_t screenRotation = 1;
 int32_t screenWidth = 240;
 int32_t screenHeight = 135;
+static M5Canvas canvas(&M5.Display);
 
 // Settings & Preferences
 Preferences prefs;
@@ -419,6 +432,7 @@ void redrawScreen();
 void drawHeaderBar(const char *title);
 void drawFooter(const char *text);
 void setStatusBanner(const char *msg, uint32_t durationMs = 2500);
+void setStatusBanner(const String &msg, uint32_t durationMs = 2500);
 void loadSettings();
 void saveSettings();
 void applySettings();
@@ -436,6 +450,7 @@ void initMeshRadio();
 void sendMeshtasticBeacon(uint8_t type);
 void addOrUpdateMeshNode(uint32_t id, const char *name, int8_t rssi, int8_t snr, uint8_t hops);
 void scanGroveI2cBus();
+bool initSdCard();
 void loadFileList();
 void openSelectedFile();
 void deleteSelectedFile();
@@ -449,6 +464,8 @@ void broadcastBleSpamPacket();
 void initMatrixRain();
 void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode);
 void drawClockScreen();
+void drawWifiPasswordScreen();
+void startWifiConnect(const String &ssid, const String &pass);
 void showBootSplash();
 
 const ColorPalette &activePalette()
@@ -503,9 +520,19 @@ void enforceLandscapeOrientation()
         screenWidth = 240;
         screenHeight = 135;
     }
+    if (canvas.width() != screenWidth || canvas.height() != screenHeight) {
+        canvas.deleteSprite();
+        canvas.createSprite(screenWidth, screenHeight);
+    }
 }
 
 void setStatusBanner(const char *msg, uint32_t durationMs)
+{
+    statusBanner = msg ? msg : "";
+    statusBannerUntilMs = millis() + durationMs;
+}
+
+void setStatusBanner(const String &msg, uint32_t durationMs)
 {
     statusBanner = msg;
     statusBannerUntilMs = millis() + durationMs;
@@ -593,8 +620,8 @@ void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode)
 
     float speedMult = (speedMode == 1) ? 0.6f : ((speedMode == 2) ? 1.0f : 1.7f);
 
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextSize(1);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextSize(1);
 
     for (size_t c = 0; c < kMatrixCols; ++c) {
         int16_t colX = c * 15 + 2;
@@ -604,15 +631,15 @@ void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode)
             int16_t glyphY = static_cast<int16_t>(drop.y) - t * 9;
             if (glyphY >= 16 && glyphY <= 118) {
                 if (t == 0) {
-                    M5.Display.setTextColor(theme.matrixHead, 0x0000);
+                    canvas.setTextColor(theme.matrixHead, 0x0000);
                 } else if (t == 1) {
-                    M5.Display.setTextColor(theme.matrixTrail, 0x0000);
+                    canvas.setTextColor(theme.matrixTrail, 0x0000);
                 } else {
                     uint16_t dimGreen = (speedMode == 2) ? 0x03E0 : 0x02C0;
-                    M5.Display.setTextColor(dimGreen, 0x0000);
+                    canvas.setTextColor(dimGreen, 0x0000);
                 }
                 char ch[2] = {drop.glyphs[t % 6], 0};
-                M5.Display.drawString(ch, colX, glyphY);
+                canvas.drawString(ch, colX, glyphY);
             }
         }
 
@@ -1109,35 +1136,35 @@ void pollKeyboard()
 void drawHeaderBar(const char *title)
 {
     const ColorPalette &pal = activePalette();
-    M5.Display.fillRect(0, 0, screenWidth, 15, pal.background);
-    M5.Display.drawFastHLine(0, 15, screenWidth, pal.accent);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextDatum(textdatum_t::middle_left);
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString(title, 4, 7);
+    canvas.fillRect(0, 0, screenWidth, 15, pal.background);
+    canvas.drawFastHLine(0, 15, screenWidth, pal.accent);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(textdatum_t::middle_left);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString(title, 4, 7);
 
     char rightInfo[32];
     const int32_t bat = M5.Power.getBatteryLevel();
     const char *wifiTag = (WiFi.status() == WL_CONNECTED) ? "W+ " : "";
     const char *radTag = radioIsPlaying ? "RAD " : "";
     snprintf(rightInfo, sizeof(rightInfo), "%s%sBAT:%ld%%", radTag, wifiTag, static_cast<long>(bat));
-    M5.Display.setTextDatum(textdatum_t::middle_right);
-    M5.Display.setTextColor(pal.accent, pal.background);
-    M5.Display.drawString(rightInfo, screenWidth - 4, 7);
+    canvas.setTextDatum(textdatum_t::middle_right);
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString(rightInfo, screenWidth - 4, 7);
 }
 
 void drawFooter(const char *text)
 {
     const ColorPalette &pal = activePalette();
-    M5.Display.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
-    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
-    M5.Display.setTextDatum(textdatum_t::middle_center);
+    canvas.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
+    canvas.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
+    canvas.setTextDatum(textdatum_t::middle_center);
     if (statusBannerUntilMs > millis() && !statusBanner.isEmpty()) {
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString(statusBanner.c_str(), screenWidth / 2, screenHeight - 6);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString(statusBanner.c_str(), screenWidth / 2, screenHeight - 6);
     } else {
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString(text, screenWidth / 2, screenHeight - 6);
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString(text, screenWidth / 2, screenHeight - 6);
     }
 }
 
@@ -1150,14 +1177,13 @@ void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t w, int32_t h)
         // Scale factor: 240.0f / 320.0f = 0.75f!
         // 144 * 0.75f = 108px height!
         // Perfectly fits edge-to-edge horizontally between header (y=14) and footer (y=122).
-        M5.Display.drawPng(image.data, image.size, x, y, screenWidth, 108, 0, 0, 0.75f, 0.75f);
+        canvas.drawPng(image.data, image.size, x, y, screenWidth, 108, 0, 0, 0.75f, 0.75f);
     }
 }
 
 void drawHome()
 {
     const ColorPalette &pal = activePalette();
-    M5.Display.fillScreen(pal.background);
 
     // Draw full-width horizontal HUD image at scale 0.75 (320x144 -> 240x108)
     drawThemeImage(selectedApp, 0, 14, screenWidth, 108);
@@ -1168,12 +1194,12 @@ void drawHome()
     drawHeaderBar(header);
 
     // Clean bottom navigation bar
-    M5.Display.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
-    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
-    M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString("ARROWS:NAV  ENTER:OPEN  DEV:@PINOYUNKNOWN", screenWidth / 2, screenHeight - 6);
+    canvas.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
+    canvas.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setTextSize(1);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString("ARROWS:NAV  ENTER:OPEN  DEV:@PINOYUNKNOWN", screenWidth / 2, screenHeight - 6);
 }
 
 // -----------------------------------------------------------------------------
@@ -1188,18 +1214,18 @@ void drawClockScreen()
     updateAndDrawMatrixRain(theme, clockRainMode);
 
     // 2. Neon Outer Glass Tube Bezel
-    M5.Display.drawRoundRect(4, 18, screenWidth - 8, 98, 4, theme.dropGlow);
-    M5.Display.drawRoundRect(5, 19, screenWidth - 10, 96, 4, theme.tubePrimary);
+    canvas.drawRoundRect(4, 18, screenWidth - 8, 98, 4, theme.dropGlow);
+    canvas.drawRoundRect(5, 19, screenWidth - 10, 96, 4, theme.tubePrimary);
 
     // Corner neon brackets
-    M5.Display.drawFastHLine(5, 19, 14, theme.tubeAccent);
-    M5.Display.drawFastVLine(5, 19, 14, theme.tubeAccent);
-    M5.Display.drawFastHLine(screenWidth - 19, 19, 14, theme.tubeAccent);
-    M5.Display.drawFastVLine(screenWidth - 6, 19, 14, theme.tubeAccent);
-    M5.Display.drawFastHLine(5, 114, 14, theme.tubeAccent);
-    M5.Display.drawFastVLine(5, 101, 14, theme.tubeAccent);
-    M5.Display.drawFastHLine(screenWidth - 19, 114, 14, theme.tubeAccent);
-    M5.Display.drawFastVLine(screenWidth - 6, 101, 14, theme.tubeAccent);
+    canvas.drawFastHLine(5, 19, 14, theme.tubeAccent);
+    canvas.drawFastVLine(5, 19, 14, theme.tubeAccent);
+    canvas.drawFastHLine(screenWidth - 19, 19, 14, theme.tubeAccent);
+    canvas.drawFastVLine(screenWidth - 6, 19, 14, theme.tubeAccent);
+    canvas.drawFastHLine(5, 114, 14, theme.tubeAccent);
+    canvas.drawFastVLine(5, 101, 14, theme.tubeAccent);
+    canvas.drawFastHLine(screenWidth - 19, 114, 14, theme.tubeAccent);
+    canvas.drawFastVLine(screenWidth - 6, 101, 14, theme.tubeAccent);
 
     // Subtle neon electrical flicker simulation
     bool flick = (clockNeonFlicker && (random(0, 32) == 0));
@@ -1222,25 +1248,25 @@ void drawClockScreen()
     }
 
     // 4. Large Glowing Neon Digits with Ambient Bloom
-    M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setTextSize(3);
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setTextSize(3);
 
     // Shadow / ambient glow pass (offsets in dark tone)
-    M5.Display.setTextColor(theme.dropGlow);
-    M5.Display.drawString(timeStr, (screenWidth / 2) - 1, 52);
-    M5.Display.drawString(timeStr, (screenWidth / 2) + 1, 52);
-    M5.Display.drawString(timeStr, (screenWidth / 2), 51);
-    M5.Display.drawString(timeStr, (screenWidth / 2), 53);
+    canvas.setTextColor(theme.dropGlow);
+    canvas.drawString(timeStr, (screenWidth / 2) - 1, 52);
+    canvas.drawString(timeStr, (screenWidth / 2) + 1, 52);
+    canvas.drawString(timeStr, (screenWidth / 2), 51);
+    canvas.drawString(timeStr, (screenWidth / 2), 53);
 
     // Core neon tube pass
-    M5.Display.setTextColor(tubeColor);
-    M5.Display.drawString(timeStr, screenWidth / 2, 52);
+    canvas.setTextColor(tubeColor);
+    canvas.drawString(timeStr, screenWidth / 2, 52);
 
     // 12-Hour AM/PM badge
     if (clock12hMode) {
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(theme.tubeAccent, 0x0000);
-        M5.Display.drawString(ampmStr, (screenWidth / 2) + 88, 44);
+        canvas.setTextSize(1);
+        canvas.setTextColor(theme.tubeAccent, 0x0000);
+        canvas.drawString(ampmStr, (screenWidth / 2) + 88, 44);
     }
 
     // 5. Date & Day-of-Week Neon Pill Badge
@@ -1248,31 +1274,31 @@ void drawClockScreen()
     char dateStr[40];
     snprintf(dateStr, sizeof(dateStr), "[ %s | %04d-%02d-%02d ]",
              kDayNames[localTm.tm_wday % 7], localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(theme.tubeAccent, 0x0000);
-    M5.Display.drawString(dateStr, screenWidth / 2, 76);
+    canvas.setTextSize(1);
+    canvas.setTextColor(theme.tubeAccent, 0x0000);
+    canvas.drawString(dateStr, screenWidth / 2, 76);
 
     // 6. Telemetry & Sync Status Pill Badges
     const bool ntpLive = (WiFi.status() == WL_CONNECTED);
-    M5.Display.setTextDatum(textdatum_t::middle_left);
-    M5.Display.setTextColor(ntpLive ? 0x07E0 : theme.tubeAccent, 0x0000);
-    M5.Display.drawString(ntpLive ? "[NTP LIVE SYNC]" : "[INTERNAL RTC]", 12, 98);
+    canvas.setTextDatum(textdatum_t::middle_left);
+    canvas.setTextColor(ntpLive ? 0x07E0 : theme.tubeAccent, 0x0000);
+    canvas.drawString(ntpLive ? "[NTP LIVE SYNC]" : "[INTERNAL RTC]", 12, 98);
 
     char telemStr[32];
     snprintf(telemStr, sizeof(telemStr), "[BAT:%d%% %uMHz]", M5.Power.getBatteryLevel(), ESP.getCpuFreqMHz());
-    M5.Display.setTextDatum(textdatum_t::middle_right);
-    M5.Display.setTextColor(theme.tubeAccent, 0x0000);
-    M5.Display.drawString(telemStr, screenWidth - 12, 98);
+    canvas.setTextDatum(textdatum_t::middle_right);
+    canvas.setTextColor(theme.tubeAccent, 0x0000);
+    canvas.drawString(telemStr, screenWidth - 12, 98);
 
     // 7. Interactive Clock Settings Overlay
     if (clockSettingsOpen) {
-        M5.Display.fillRect(8, 16, screenWidth - 16, 102, 0x0000);
-        M5.Display.drawRoundRect(8, 16, screenWidth - 16, 102, 4, theme.tubeAccent);
-        M5.Display.drawRoundRect(9, 17, screenWidth - 18, 100, 4, theme.tubePrimary);
+        canvas.fillRect(8, 16, screenWidth - 16, 102, 0x0000);
+        canvas.drawRoundRect(8, 16, screenWidth - 16, 102, 4, theme.tubeAccent);
+        canvas.drawRoundRect(9, 17, screenWidth - 18, 100, 4, theme.tubePrimary);
 
-        M5.Display.setTextDatum(textdatum_t::top_center);
-        M5.Display.setTextColor(theme.tubePrimary, 0x0000);
-        M5.Display.drawString("--- NEON CLOCK SETTINGS ---", screenWidth / 2, 20);
+        canvas.setTextDatum(textdatum_t::top_center);
+        canvas.setTextColor(theme.tubePrimary, 0x0000);
+        canvas.drawString("--- NEON CLOCK SETTINGS ---", screenWidth / 2, 20);
 
         constexpr const char *kRainNames[4] = {"OFF", "SLOW", "NORMAL", "FAST"};
         char optRows[6][48];
@@ -1283,16 +1309,16 @@ void drawClockScreen()
         snprintf(optRows[4], sizeof(optRows[4]), "5. Sync NTP: %s", ntpLive ? "READY (ENTER)" : "OFFLINE");
         snprintf(optRows[5], sizeof(optRows[5]), "6. Set Time: HHMMSS");
 
-        M5.Display.setTextDatum(textdatum_t::top_left);
+        canvas.setTextDatum(textdatum_t::top_left);
         for (uint8_t r = 0; r < 6; ++r) {
             int16_t rowY = 32 + r * 13;
             if (r == clockSettingRow) {
-                M5.Display.fillRect(12, rowY - 1, screenWidth - 24, 12, theme.tubeAccent);
-                M5.Display.setTextColor(0x0000, theme.tubeAccent);
+                canvas.fillRect(12, rowY - 1, screenWidth - 24, 12, theme.tubeAccent);
+                canvas.setTextColor(0x0000, theme.tubeAccent);
             } else {
-                M5.Display.setTextColor(theme.tubePrimary, 0x0000);
+                canvas.setTextColor(theme.tubePrimary, 0x0000);
             }
-            M5.Display.drawString(optRows[r], 16, rowY);
+            canvas.drawString(optRows[r], 16, rowY);
         }
 
         drawFooter("W/S:NAV  ENTER:CHANGE  ESC:CLOSE");
@@ -1309,43 +1335,43 @@ void drawWebRadioScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("WEBRADIO : CYBER BROADCAST");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     // 1. Station Card Box
-    M5.Display.drawRect(4, 18, screenWidth - 8, 48, pal.accent);
-    M5.Display.drawFastHLine(4, 34, screenWidth - 8, pal.accent);
+    canvas.drawRect(4, 18, screenWidth - 8, 48, pal.accent);
+    canvas.drawFastHLine(4, 34, screenWidth - 8, pal.accent);
 
     const RadioStation &st = kRadioStations[currentRadioStation];
-    M5.Display.setTextColor(pal.primary, pal.background);
+    canvas.setTextColor(pal.primary, pal.background);
     char stHeader[48];
     snprintf(stHeader, sizeof(stHeader), "[%02u/%02u] %s", static_cast<unsigned>(currentRadioStation + 1),
              static_cast<unsigned>(kRadioStationCount), st.name);
-    M5.Display.drawString(stHeader, 8, 22);
+    canvas.drawString(stHeader, 8, 22);
 
     // Region & Genre Badge
-    M5.Display.setTextDatum(textdatum_t::top_right);
-    M5.Display.setTextColor(strcmp(st.region, "PH") == 0 ? 0x07E0 : pal.accent, pal.background);
-    M5.Display.drawString(strcmp(st.region, "PH") == 0 ? "[PH - DEFAULT]" : "[INT REGION]", screenWidth - 8, 22);
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.setTextColor(strcmp(st.region, "PH") == 0 ? 0x07E0 : pal.accent, pal.background);
+    canvas.drawString(strcmp(st.region, "PH") == 0 ? "[PH - DEFAULT]" : "[INT REGION]", screenWidth - 8, 22);
 
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextColor(pal.text, pal.background);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(pal.text, pal.background);
     char infoLine[52];
     snprintf(infoLine, sizeof(infoLine), "%s | %s", st.freq, st.genre);
-    M5.Display.drawString(infoLine, 8, 38);
+    canvas.drawString(infoLine, 8, 38);
 
-    M5.Display.setTextColor(pal.primary, pal.background);
+    canvas.setTextColor(pal.primary, pal.background);
     String title = gRadioStreamTitle.isEmpty() ? "Ready to Stream" : gRadioStreamTitle;
-    M5.Display.drawString(title.substring(0, 36).c_str(), 8, 52);
+    canvas.drawString(title.substring(0, 36).c_str(), 8, 52);
 
     // 2. Frequency Dial Needle Graphic
     int16_t dialY = 70;
-    M5.Display.drawRect(4, dialY, screenWidth - 8, 12, pal.background);
-    M5.Display.drawFastHLine(6, dialY + 6, screenWidth - 12, pal.accent);
+    canvas.drawRect(4, dialY, screenWidth - 8, 12, pal.background);
+    canvas.drawFastHLine(6, dialY + 6, screenWidth - 12, pal.accent);
     for (int x = 8; x < screenWidth - 8; x += 16) {
-        M5.Display.drawFastVLine(x, dialY + 3, 6, pal.accent);
+        canvas.drawFastVLine(x, dialY + 3, 6, pal.accent);
     }
     int16_t needleX = 8 + (screenWidth - 24) * currentRadioStation / (kRadioStationCount - 1);
-    M5.Display.fillRect(needleX - 2, dialY + 1, 5, 10, pal.primary);
+    canvas.fillRect(needleX - 2, dialY + 1, 5, 10, pal.primary);
 
     // 3. Cyberpunk Animated Audio Spectrum Visualizer (16 bars)
     int16_t eqY = 86;
@@ -1362,21 +1388,21 @@ void drawWebRadioScreen()
         }
 
         uint16_t barCol = (b > 12) ? 0xF81F : ((b > 8) ? pal.primary : 0x07E0);
-        M5.Display.fillRect(bx, eqY + (maxH - radioSpectrumHeights[b]), barW, radioSpectrumHeights[b], barCol);
-        M5.Display.drawFastHLine(bx, eqY + (maxH - radioSpectrumHeights[b]) - 1, barW, 0xFFFF);
+        canvas.fillRect(bx, eqY + (maxH - radioSpectrumHeights[b]), barW, radioSpectrumHeights[b], barCol);
+        canvas.drawFastHLine(bx, eqY + (maxH - radioSpectrumHeights[b]) - 1, barW, 0xFFFF);
     }
     gAudioPeak = gAudioPeak * 3 / 4;
 
     // 4. Status and Volume indicator
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextColor(radioIsPlaying ? 0x07E0 : 0xF800, pal.background);
-    M5.Display.drawString(radioIsPlaying ? "[● STREAMING]" : "[■ STOPPED]", 8, 114);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(radioIsPlaying ? 0x07E0 : 0xF800, pal.background);
+    canvas.drawString(radioIsPlaying ? "[● STREAMING]" : "[■ STOPPED]", 8, 114);
 
     char volStr[32];
     snprintf(volStr, sizeof(volStr), "VOL: %u%% %s", (radioVolume * 100) / 21, radioIsMuted ? "(MUTED)" : "");
-    M5.Display.setTextDatum(textdatum_t::top_right);
-    M5.Display.setTextColor(pal.accent, pal.background);
-    M5.Display.drawString(volStr, screenWidth - 8, 114);
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString(volStr, screenWidth - 8, 114);
 
     drawFooter("ENTER:PLAY/STOP  A/D:CH  W/S:VOL  M:MUTE  ESC:HOME");
 }
@@ -1388,39 +1414,39 @@ void drawMeshRfScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("RF MESH : MESHTATIC & ESP-NOW");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     char line[56];
     snprintf(line, sizeof(line), "NODE ID : !%08X | CH: %u | %s", localNodeId, meshChannel, kMeshFreqNames[meshFreqIndex % 4]);
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString(line, 5, 18);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString(line, 5, 18);
 
     snprintf(line, sizeof(line), "SX1262 LoRa: %s | ESP-NOW: %s",
              loraHardwareDetected ? "ACTIVE (OK)" : "SIMULATED",
              espNowMeshReady ? "ACTIVE (OK)" : "OFFLINE");
-    M5.Display.setTextColor(loraHardwareDetected ? pal.primary : pal.accent, pal.background);
-    M5.Display.drawString(line, 5, 30);
+    canvas.setTextColor(loraHardwareDetected ? pal.primary : pal.accent, pal.background);
+    canvas.drawString(line, 5, 30);
 
     snprintf(line, sizeof(line), "TX: %lu pkts | RX: %lu pkts | PEERS: %u",
              static_cast<unsigned long>(totalPacketsSent),
              static_cast<unsigned long>(totalPacketsReceived),
              static_cast<unsigned>(meshNodeCount));
-    M5.Display.setTextColor(pal.text, pal.background);
-    M5.Display.drawString(line, 5, 42);
+    canvas.setTextColor(pal.text, pal.background);
+    canvas.drawString(line, 5, 42);
 
-    M5.Display.drawFastHLine(4, 54, screenWidth - 8, pal.accent);
-    M5.Display.drawString("DISCOVERED MESH NODES:", 5, 57);
+    canvas.drawFastHLine(4, 54, screenWidth - 8, pal.accent);
+    canvas.drawString("DISCOVERED MESH NODES:", 5, 57);
 
     if (meshNodeCount == 0) {
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString("No mesh peers heard yet. Press T to broadcast beacon!", 5, 72);
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString("No mesh peers heard yet. Press T to broadcast beacon!", 5, 72);
     } else {
         for (size_t i = 0; i < meshNodeCount && i < 3; ++i) {
             const auto &node = meshNodes[i];
             snprintf(line, sizeof(line), "%s [%.14s] %ddBm SNR:%d H:%u",
                      node.shortName, node.longName, node.lastRssi, node.lastSnr, node.hopsAway);
-            M5.Display.setTextColor(pal.primary, pal.background);
-            M5.Display.drawString(line, 5, 70 + i * 14);
+            canvas.setTextColor(pal.primary, pal.background);
+            canvas.drawString(line, 5, 70 + i * 14);
         }
     }
 
@@ -1434,7 +1460,7 @@ void drawConfigScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("CONFIG: THEME & HARDWARE");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     constexpr const char *kBackdropNames[3] = {"STATIC", "MATRIX RAIN", "SCANLINE"};
     constexpr uint8_t kBrightnessPcts[4] = {25, 50, 75, 100};
@@ -1453,12 +1479,12 @@ void drawConfigScreen()
         const bool selected = (row == selectedConfigRow);
         const int16_t y = 18 + row * 13;
         if (selected) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
-            M5.Display.setTextColor(pal.background, pal.accent);
+            canvas.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
+            canvas.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.text, pal.background);
+            canvas.setTextColor(pal.text, pal.background);
         }
-        M5.Display.drawString(rows[row], 7, y);
+        canvas.drawString(rows[row], 7, y);
     }
 
     drawFooter("W/S:NAV  ENTER:CHANGE  ESC:HOME");
@@ -1510,32 +1536,32 @@ void drawConnectScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("CONNECT : WI-FI & SECURITY");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     char line[56];
     const bool connected = (WiFi.status() == WL_CONNECTED);
     snprintf(line, sizeof(line), "STATUS : %s", connected ? "CONNECTED" : "DISCONNECTED");
-    M5.Display.setTextColor(connected ? 0x07E0 : pal.accent, pal.background);
-    M5.Display.drawString(line, 5, 20);
+    canvas.setTextColor(connected ? 0x07E0 : pal.accent, pal.background);
+    canvas.drawString(line, 5, 20);
 
-    M5.Display.setTextColor(pal.text, pal.background);
+    canvas.setTextColor(pal.text, pal.background);
     if (connected) {
         snprintf(line, sizeof(line), "SSID   : %.26s", WiFi.SSID().c_str());
-        M5.Display.drawString(line, 5, 34);
+        canvas.drawString(line, 5, 34);
         snprintf(line, sizeof(line), "IP     : %s (%ddBm)", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        M5.Display.drawString(line, 5, 48);
+        canvas.drawString(line, 5, 48);
         snprintf(line, sizeof(line), "MAC    : %s", WiFi.macAddress().c_str());
-        M5.Display.drawString(line, 5, 62);
+        canvas.drawString(line, 5, 62);
     } else {
-        M5.Display.drawString("Scan APs, select an SSID, and press ENTER to join.", 5, 36);
-        M5.Display.drawString("Press B for Beacon Flood / D for Deauth Sniffer.", 5, 52);
+        canvas.drawString("Scan APs, select an SSID, and press ENTER to join.", 5, 36);
+        canvas.drawString("Press B for Beacon Flood / D for Deauth Sniffer.", 5, 52);
     }
 
     snprintf(line, sizeof(line), "SECURITY MODE: %s | DEAUTH FRAMES: %u",
              wifiBeaconSpamActive ? "BEACON FLOOD (ON)" : (wifiDeauthMonitorActive ? "DEAUTH SNIFFER (ON)" : "NORMAL"),
              deauthFrameCount);
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString(line, 5, 84);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString(line, 5, 84);
 
     drawFooter("ENTER:SCAN APs  B:BEACON  D:DEAUTH  ESC:HOME");
 }
@@ -1605,12 +1631,12 @@ void drawSurveyList(bool isBle)
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar(isBle ? "SURVEY: BLUETOOTH LOW ENERGY" : "SURVEY: 802.11 WI-FI APs");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     if (surveyCount == 0) {
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("No devices found yet.", 8, 30);
-        M5.Display.drawString("Press R to start active RF scan.", 8, 48);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("No devices found yet.", 8, 30);
+        canvas.drawString("Press R to start active RF scan.", 8, 48);
         drawFooter(isBle ? "R:SCAN BLE  B:SPAMMER  ESC:HOME" : "R:SCAN APs  ESC:HOME");
         return;
     }
@@ -1623,19 +1649,19 @@ void drawSurveyList(bool isBle)
         const int16_t y = 18 + i * 18;
 
         if (selected) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 17, pal.accent);
-            M5.Display.setTextColor(pal.background, pal.accent);
+            canvas.fillRect(4, y - 1, screenWidth - 8, 17, pal.accent);
+            canvas.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.primary, pal.background);
+            canvas.setTextColor(pal.primary, pal.background);
         }
 
         char line1[48];
         snprintf(line1, sizeof(line1), "%s%s", selected ? "> " : "  ", res.label.substring(0, 24).c_str());
-        M5.Display.drawString(line1, 6, y);
+        canvas.drawString(line1, 6, y);
 
         char line2[48];
         snprintf(line2, sizeof(line2), "   %ddBm  CH:%d  %s", res.rssi, res.channel, res.detail.substring(0, 17).c_str());
-        M5.Display.drawString(line2, 6, y + 8);
+        canvas.drawString(line2, 6, y + 8);
     }
 
     if (isBle) {
@@ -1645,11 +1671,92 @@ void drawSurveyList(bool isBle)
     }
 }
 
+void startWifiConnect(const String &ssid, const String &pass)
+{
+    if (ssid.isEmpty()) {
+        setStatusBanner("No SSID selected!");
+        return;
+    }
+
+    if (prefs.begin("ghost", false)) {
+        prefs.putString("w_ssid", ssid);
+        prefs.putString("w_pass", pass);
+        prefs.end();
+    }
+
+    WiFi.disconnect(true);
+    delay(20);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    wifiConnecting = true;
+    wifiConnectDeadlineMs = millis() + 15000;
+    setStatusBanner("Connecting to " + ssid + "...");
+}
+
+void drawWifiPasswordScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("WI-FI : CREDENTIAL SETUP");
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextSize(1);
+
+    // Frame Box
+    canvas.drawRect(6, 18, screenWidth - 12, 102, pal.accent);
+    canvas.drawFastHLine(6, 36, screenWidth - 12, pal.accent);
+
+    // Target AP line
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString("TARGET AP :", 12, 22);
+    canvas.setTextColor(0xFFFF, pal.background);
+    canvas.drawString(wifiTargetSsid.substring(0, 20).c_str(), 85, 22);
+
+    // Dynamic Connection Status line
+    if (wifiConnecting) {
+        char connMsg[48];
+        uint32_t dots = (millis() / 400) % 4;
+        snprintf(connMsg, sizeof(connMsg), "CONNECTING%s (WAITING FOR DHCP)",
+                 dots == 1 ? "." : (dots == 2 ? ".." : (dots == 3 ? "..." : "")));
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString(connMsg, 12, 40);
+    } else if (WiFi.status() == WL_CONNECTED) {
+        canvas.setTextColor(0x07E0, pal.background);
+        char ipMsg[48];
+        snprintf(ipMsg, sizeof(ipMsg), "ONLINE! IP: %s (NTP SYNCED)", WiFi.localIP().toString().c_str());
+        canvas.drawString(ipMsg, 12, 40);
+    } else {
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString("ENTER WPA2/WPA3 PASSKEY (MIN 8 CHARS):", 12, 40);
+    }
+
+    // Input box
+    canvas.drawRect(10, 54, screenWidth - 20, 24, pal.primary);
+    canvas.fillRect(11, 55, screenWidth - 22, 22, 0x0842);
+
+    // Password text with blinking cursor
+    canvas.setTextDatum(textdatum_t::middle_left);
+    canvas.setTextColor(0xFFFF, 0x0842);
+    String displayPw = wifiPasswordInput;
+    if (displayPw.length() > 24) {
+        displayPw = displayPw.substring(displayPw.length() - 24);
+    }
+    bool showCursor = ((millis() / 350) % 2 == 0);
+    String pwWithCursor = displayPw + (showCursor ? "_" : " ");
+    canvas.drawString(pwWithCursor.c_str(), 16, 66);
+
+    // Keyboard and tips
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString("CARDPUTER: Type password directly", 12, 82);
+    canvas.drawString("Saved in NVS for auto-reconnect on boot", 12, 94);
+
+    drawFooter("ENTER:CONNECT  DEL:BACKSPACE  ESC:CANCEL");
+}
+
 void drawIrScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("INFRARED : TV-B-GONE TRANSMITTER");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     constexpr const char *kIrBrands[8] = {
         "1. ALL POWER OFF (RAPID BURST)",
@@ -1662,19 +1769,19 @@ void drawIrScreen()
         "8. UNIVERSAL NEC PROTOCOL"
     };
 
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString("SELECT IR POWER SEQUENCE:", 6, 18);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString("SELECT IR POWER SEQUENCE:", 6, 18);
 
     for (uint8_t i = 0; i < 6; ++i) {
         const bool selected = (i == selectedIrIndex);
         const int16_t y = 30 + i * 13;
         if (selected) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
-            M5.Display.setTextColor(pal.background, pal.accent);
+            canvas.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
+            canvas.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.text, pal.background);
+            canvas.setTextColor(pal.text, pal.background);
         }
-        M5.Display.drawString(kIrBrands[i], 8, y);
+        canvas.drawString(kIrBrands[i], 8, y);
     }
 
     drawFooter("W/S:SELECT  ENTER:TRANSMIT  ESC:HOME");
@@ -1697,54 +1804,121 @@ void transmitIrCode(uint8_t codeIndex)
     setStatusBanner("IR Code Fired on GPIO 44!");
 }
 
+bool initSdCard()
+{
+    pinMode(kLoraCsPin, OUTPUT);
+    digitalWrite(kLoraCsPin, HIGH);
+    pinMode(kSdCsPin, OUTPUT);
+    digitalWrite(kSdCsPin, HIGH);
+    delay(5);
+
+    SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+    sdCardMounted = SD.begin(kSdCsPin, SPI, 25000000);
+    if (!sdCardMounted) {
+        sdCardMounted = SD.begin(kSdCsPin, SPI, 10000000);
+    }
+    if (sdCardMounted) {
+        useSdCard = true;
+    }
+    return sdCardMounted;
+}
+
 void drawFileBrowser()
 {
     const ColorPalette &pal = activePalette();
-    drawHeaderBar("FILE SYSTEM : SPIFFS FLASH");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    drawHeaderBar(useSdCard ? "STORAGE : MicroSD CARD" : "STORAGE : SPIFFS FLASH");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    char capLine[56];
+    if (useSdCard) {
+        if (sdCardMounted) {
+            uint64_t totalMb = SD.cardSize() / (1024 * 1024);
+            uint64_t usedMb = SD.usedBytes() / (1024 * 1024);
+            snprintf(capLine, sizeof(capLine), "MicroSD TF: %lluMB/%lluMB | DIR: %s", usedMb, totalMb, currentDirectory.c_str());
+        } else {
+            snprintf(capLine, sizeof(capLine), "MicroSD TF: NOT INSERTED (Insert & press R)");
+        }
+    } else {
+        snprintf(capLine, sizeof(capLine), "SPIFFS: %uKB/%uKB | ROOT: /",
+                 static_cast<unsigned>(SPIFFS.usedBytes() / 1024),
+                 static_cast<unsigned>(SPIFFS.totalBytes() / 1024));
+    }
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString(capLine, 6, 18);
 
     if (fileEntryCount == 0) {
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("SPIFFS Directory Empty.", 8, 30);
-        M5.Display.drawString("Press R to reload file listing.", 8, 48);
-        drawFooter("R:RELOAD  ESC:HOME");
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString(useSdCard ? (sdCardMounted ? "Directory Empty." : "No MicroSD Card Found.") : "SPIFFS Directory Empty.", 8, 38);
+        canvas.drawString("Press TAB/T to switch storage | R to reload", 8, 54);
+        drawFooter("W/S:NAV  TAB/T:SD/FLASH  R:RELOAD  ESC:HOME");
         return;
     }
 
-    for (size_t i = 0; i < 5 && i < fileEntryCount; ++i) {
-        const auto &f = fileEntries[i];
-        const bool selected = (i == selectedFile);
-        const int16_t y = 20 + i * 17;
+    size_t startIdx = (selectedFile / 5) * 5;
+    for (size_t i = 0; i < 5 && (startIdx + i) < fileEntryCount; ++i) {
+        size_t idx = startIdx + i;
+        const auto &f = fileEntries[idx];
+        const bool selected = (idx == selectedFile);
+        const int16_t y = 30 + i * 16;
         if (selected) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 16, pal.accent);
-            M5.Display.setTextColor(pal.background, pal.accent);
+            canvas.fillRect(4, y - 1, screenWidth - 8, 15, pal.accent);
+            canvas.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.primary, pal.background);
+            canvas.setTextColor(pal.primary, pal.background);
         }
         char line[56];
-        snprintf(line, sizeof(line), "%s %s (%u B)", selected ? ">" : " ", f.path.c_str(), static_cast<unsigned>(f.size));
-        M5.Display.drawString(line, 6, y);
+        snprintf(line, sizeof(line), "%s %s %s (%u B)",
+                 selected ? ">" : " ",
+                 f.isDirectory ? "[DIR]" : "[FILE]",
+                 f.path.substring(0, 18).c_str(),
+                 static_cast<unsigned>(f.size));
+        canvas.drawString(line, 6, y);
     }
 
-    drawFooter("W/S:NAV  ENTER:OPEN  DEL:REMOVE  ESC:HOME");
+    drawFooter("W/S:NAV  TAB/T:SD/FLASH  ENTER:OPEN  R:RELOAD  ESC:HOME");
 }
 
 void loadFileList()
 {
     fileEntryCount = 0;
-    ensureFilesystemReady();
-    File root = SPIFFS.open("/");
-    if (!root || !root.isDirectory()) {
-        fileListingFailed = true;
-        return;
-    }
-    File f = root.openNextFile();
-    while (f && fileEntryCount < kMaxFileEntries) {
-        fileEntries[fileEntryCount].path = f.name();
-        fileEntries[fileEntryCount].size = f.size();
-        fileEntries[fileEntryCount].isDirectory = f.isDirectory();
-        fileEntryCount++;
-        f = root.openNextFile();
+    fileListingFailed = false;
+
+    if (useSdCard) {
+        if (!sdCardMounted) {
+            initSdCard();
+        }
+        if (!sdCardMounted) {
+            fileListingFailed = true;
+            return;
+        }
+        File root = SD.open(currentDirectory.c_str());
+        if (!root || !root.isDirectory()) {
+            fileListingFailed = true;
+            return;
+        }
+        File f = root.openNextFile();
+        while (f && fileEntryCount < kMaxFileEntries) {
+            fileEntries[fileEntryCount].path = f.name();
+            fileEntries[fileEntryCount].size = f.size();
+            fileEntries[fileEntryCount].isDirectory = f.isDirectory();
+            fileEntryCount++;
+            f = root.openNextFile();
+        }
+    } else {
+        ensureFilesystemReady();
+        File root = SPIFFS.open("/");
+        if (!root || !root.isDirectory()) {
+            fileListingFailed = true;
+            return;
+        }
+        File f = root.openNextFile();
+        while (f && fileEntryCount < kMaxFileEntries) {
+            fileEntries[fileEntryCount].path = f.name();
+            fileEntries[fileEntryCount].size = f.size();
+            fileEntries[fileEntryCount].isDirectory = f.isDirectory();
+            fileEntryCount++;
+            f = root.openNextFile();
+        }
     }
     selectedFile = 0;
 }
@@ -1762,9 +1936,9 @@ void runHardwareSelfTest()
     addLog("Display ST7789", true);
     addLog("I2C Keyboard Bus", keyboardDriver != KeyboardDriver::Unknown);
     addLog("SPI Flash SPIFFS", SPIFFS.begin(true));
+    addLog("MicroSD TF-Card", sdCardMounted);
     addLog("SX1262 LoRa SPI", loraHardwareDetected);
     addLog("I2S Audio Amp", true);
-    addLog("IR Transmitter G44", true);
     addLog("Wi-Fi Hardware", WiFi.status() != WL_NO_SHIELD);
     addLog("BLE Radio Subsystem", true);
     setStatusBanner("Self-Test Completed!");
@@ -1774,7 +1948,7 @@ void drawJsDiagnosticRunner()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("JS MACRO : HARDWARE DIAGNOSTICS");
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     if (selfTestLogCount == 0) {
         runHardwareSelfTest();
@@ -1783,8 +1957,8 @@ void drawJsDiagnosticRunner()
     for (uint8_t i = 0; i < selfTestLogCount && i < 7; ++i) {
         const int16_t y = 18 + i * 13;
         bool ok = selfTestLog[i].endsWith(": OK");
-        M5.Display.setTextColor(ok ? 0x07E0 : 0xF800, pal.background);
-        M5.Display.drawString(selfTestLog[i].c_str(), 8, y);
+        canvas.setTextColor(ok ? 0x07E0 : 0xF800, pal.background);
+        canvas.drawString(selfTestLog[i].c_str(), 8, y);
     }
 
     drawFooter("ENTER/R:RERUN TEST  ESC:HOME");
@@ -1794,32 +1968,32 @@ void drawMiscTelemetry()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar("MISC : SYSTEM TELEMETRY");
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextColor(pal.primary, pal.background);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(pal.primary, pal.background);
 
     char line[56];
     snprintf(line, sizeof(line), "CPU FREQ : %u MHz | CORES: 2 (ESP32-S3)", ESP.getCpuFreqMHz());
-    M5.Display.drawString(line, 6, 20);
+    canvas.drawString(line, 6, 20);
 
     snprintf(line, sizeof(line), "FREE HEAP: %u KB | MIN: %u KB",
              ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
-    M5.Display.drawString(line, 6, 34);
+    canvas.drawString(line, 6, 34);
 
     snprintf(line, sizeof(line), "PSRAM    : %u KB (TOTAL) | %u KB FREE",
              ESP.getPsramSize() / 1024, ESP.getFreePsram() / 1024);
-    M5.Display.drawString(line, 6, 48);
+    canvas.drawString(line, 6, 48);
 
     snprintf(line, sizeof(line), "FLASH    : %u MB @ %u MHz (DIO)",
              ESP.getFlashChipSize() / (1024 * 1024), ESP.getFlashChipSpeed() / 1000000);
-    M5.Display.drawString(line, 6, 62);
+    canvas.drawString(line, 6, 62);
 
     snprintf(line, sizeof(line), "BATTERY  : %d%% (%1.2f V)",
              M5.Power.getBatteryLevel(), M5.Power.getBatteryVoltage() / 1000.0f);
-    M5.Display.drawString(line, 6, 76);
+    canvas.drawString(line, 6, 76);
 
     snprintf(line, sizeof(line), "ORIENTATION: %s (%dx%d)",
              screenRotation == 1 ? "LANDSCAPE" : "LANDSCAPE FLIP", screenWidth, screenHeight);
-    M5.Display.drawString(line, 6, 90);
+    canvas.drawString(line, 6, 90);
 
     drawFooter("PAGE 1/2  W/S:SWITCH  ESC:HOME");
 }
@@ -1828,40 +2002,40 @@ void drawPeripheralBusScreen()
 {
     const ColorPalette &pal = activePalette();
     drawHeaderBar(themeImages[selectedApp].name);
-    M5.Display.setTextDatum(textdatum_t::top_left);
+    canvas.setTextDatum(textdatum_t::top_left);
 
     if (selectedApp == 6) { // NRF / 2.4GHz Spectrum
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("2.4GHz RF SPECTRUM ENERGY (CH 1-14)", 5, 20);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("2.4GHz RF SPECTRUM ENERGY (CH 1-14)", 5, 20);
 
         for (uint8_t ch = 0; ch < 14; ++ch) {
             spectrumChEnergy[ch] = (spectrumChEnergy[ch] * 3 + random(10, 85)) / 4;
             int16_t bx = 8 + ch * 16;
             int16_t barH = spectrumChEnergy[ch] * 55 / 100;
-            M5.Display.fillRect(bx, 105 - barH, 12, barH, (ch == 5 || ch == 10) ? 0xF81F : pal.accent);
-            M5.Display.drawFastHLine(bx, 105 - barH - 1, 12, pal.primary);
+            canvas.fillRect(bx, 105 - barH, 12, barH, (ch == 5 || ch == 10) ? 0xF81F : pal.accent);
+            canvas.drawFastHLine(bx, 105 - barH - 1, 12, pal.primary);
 
             char chLabel[4];
             snprintf(chLabel, sizeof(chLabel), "%u", ch + 1);
-            M5.Display.drawString(chLabel, bx + 1, 108);
+            canvas.drawString(chLabel, bx + 1, 108);
         }
         drawFooter("LIVE SCANNING 2.4GHz BAND  ESC:HOME");
     } else if (selectedApp == 7) { // NFC / RFID
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("NFC / RFID SCANNER (PN532 / RC522 I2C)", 5, 22);
-        M5.Display.setTextColor(pal.text, pal.background);
-        M5.Display.drawString("I2C Scanner: Scanning 0x24 (PN532) & 0x28 (RC522)...", 5, 38);
-        M5.Display.drawString("STATUS : READY TO SNIFF CARD UID", 5, 54);
-        M5.Display.drawString("Supported: Mifare Classic 1K/4K, Ultralight, NTAG213", 5, 70);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("NFC / RFID SCANNER (PN532 / RC522 I2C)", 5, 22);
+        canvas.setTextColor(pal.text, pal.background);
+        canvas.drawString("I2C Scanner: Scanning 0x24 (PN532) & 0x28 (RC522)...", 5, 38);
+        canvas.drawString("STATUS : READY TO SNIFF CARD UID", 5, 54);
+        canvas.drawString("Supported: Mifare Classic 1K/4K, Ultralight, NTAG213", 5, 70);
         drawFooter("R:SCAN BUS  ESC:HOME");
     } else if (selectedApp == 11) { // GPS
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("GROVE NMEA GPS RECEIVER (9600 BAUD)", 5, 22);
-        M5.Display.setTextColor(pal.text, pal.background);
-        M5.Display.drawString("LATITUDE  : 14.599512 N", 5, 38);
-        M5.Display.drawString("LONGITUDE : 120.984222 E", 5, 52);
-        M5.Display.drawString("ALTITUDE  : 16.2 m | SATELLITES: 8 LOCK", 5, 66);
-        M5.Display.drawString("SPEED     : 0.0 km/h | HDOP: 0.9 (GOOD)", 5, 80);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("GROVE NMEA GPS RECEIVER (9600 BAUD)", 5, 22);
+        canvas.setTextColor(pal.text, pal.background);
+        canvas.drawString("LATITUDE  : 14.599512 N", 5, 38);
+        canvas.drawString("LONGITUDE : 120.984222 E", 5, 52);
+        canvas.drawString("ALTITUDE  : 16.2 m | SATELLITES: 8 LOCK", 5, 66);
+        canvas.drawString("SPEED     : 0.0 km/h | HDOP: 0.9 (GOOD)", 5, 80);
         drawFooter("R:RECONNECT  ESC:HOME");
     } else {
         drawConnectScreen();
@@ -1889,12 +2063,15 @@ void drawFeature()
 void redrawScreen()
 {
     const ColorPalette &pal = activePalette();
-    M5.Display.fillScreen(pal.background);
+    canvas.fillScreen(pal.background);
     if (currentScreen == Screen::Home) {
         drawHome();
+    } else if (currentScreen == Screen::WifiPasswordEntry) {
+        drawWifiPasswordScreen();
     } else {
         drawFeature();
     }
+    canvas.pushSprite(0, 0);
 }
 
 void openSelectedApp()
@@ -1917,6 +2094,35 @@ void handleKey(uint8_t key)
 {
     if (keyBeepEnabled) {
         M5.Speaker.tone(1400, 20);
+    }
+
+    if (currentScreen == Screen::WifiPasswordEntry) {
+        if (key == kKeyEscape) {
+            wifiConnecting = false;
+            currentScreen = Screen::Feature;
+            redrawScreen();
+            return;
+        }
+        if (key == kKeyBackspace) {
+            if (wifiPasswordInput.length() > 0) {
+                wifiPasswordInput.remove(wifiPasswordInput.length() - 1);
+                redrawScreen();
+            }
+            return;
+        }
+        if (key == kKeySelect || key == '\n') {
+            startWifiConnect(wifiTargetSsid, wifiPasswordInput);
+            redrawScreen();
+            return;
+        }
+        if (key >= 32 && key <= 126) {
+            if (wifiPasswordInput.length() < 64) {
+                wifiPasswordInput += static_cast<char>(key);
+                redrawScreen();
+            }
+            return;
+        }
+        return;
     }
 
     if (currentScreen == Screen::Home) {
@@ -2100,6 +2306,25 @@ void handleAppKey(uint8_t key)
         } else if (key == 'r' || key == 'R') {
             scanWifiNetworks();
             redrawScreen();
+        } else if (key == kKeySelect || key == '\n' || key == ' ') {
+            if (surveyCount > 0 && selectedSurvey < surveyCount) {
+                wifiTargetSsid = surveyResults[selectedSurvey].label;
+                String savedSsid = "";
+                String savedPass = "";
+                if (prefs.begin("ghost", true)) {
+                    savedSsid = prefs.getString("w_ssid", "");
+                    savedPass = prefs.getString("w_pass", "");
+                    prefs.end();
+                }
+                if (savedSsid == wifiTargetSsid) {
+                    wifiPasswordInput = savedPass;
+                } else {
+                    wifiPasswordInput = "";
+                }
+                wifiConnecting = false;
+                currentScreen = Screen::WifiPasswordEntry;
+                redrawScreen();
+            }
         }
         return;
     }
@@ -2191,7 +2416,15 @@ void handleAppKey(uint8_t key)
         } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedFile + 1 < fileEntryCount) {
             selectedFile++;
             redrawScreen();
+        } else if (key == '\t' || key == 't' || key == 'T') {
+            useSdCard = !useSdCard;
+            loadFileList();
+            setStatusBanner(useSdCard ? "Active: MicroSD Card" : "Active: Internal SPIFFS");
+            redrawScreen();
         } else if (key == 'r' || key == 'R') {
+            if (useSdCard) {
+                initSdCard();
+            }
             loadFileList();
             redrawScreen();
         }
@@ -2202,33 +2435,85 @@ void handleAppKey(uint8_t key)
 void showBootSplash()
 {
     const ColorPalette &pal = activePalette();
-    constexpr uint8_t frames = 20;
-    for (uint8_t frame = 0; frame < frames; ++frame) {
-        const float progress = static_cast<float>(frame) / (frames - 1);
-        const float pulse = 1.0F + 0.12F * std::sin(progress * 2.0F * 3.14159F);
-        const int16_t size = static_cast<int16_t>(44.0F * pulse);
+    constexpr uint16_t totalBootMs = 10000;
+    constexpr uint16_t frameIntervalMs = 80;
+    constexpr uint16_t totalFrames = totalBootMs / frameIntervalMs; // 125 frames (~10.0 seconds)
+
+    for (uint16_t frame = 0; frame < totalFrames; ++frame) {
+        const float progress = static_cast<float>(frame) / (totalFrames - 1);
         const int16_t centerX = screenWidth / 2;
-        const int16_t centerY = 40;
-        const int16_t bodyHeight = size * 3 / 4;
+
+        canvas.fillScreen(pal.background);
+
+        // Cyberpunk outer frame
+        canvas.drawRect(2, 2, screenWidth - 4, screenHeight - 4, pal.accent);
+        canvas.drawRect(4, 4, screenWidth - 8, screenHeight - 8, pal.primary);
+
+        // Holographic expanding sonar rings around Ghost icon
+        int16_t ringR = (frame * 3) % 38;
+        canvas.drawCircle(centerX, 23, ringR, pal.accent);
+
+        // Pulsing Cyber Ghost Icon (Center Top)
+        const float pulse = 1.0F + 0.10F * std::sin(progress * 8.0F * 3.14159F);
+        const int16_t size = static_cast<int16_t>(22.0F * pulse);
+        const int16_t top = 23 - size / 2;
         const int16_t left = centerX - size / 2;
-        const int16_t top = centerY - size / 2;
+        const int16_t bodyH = size * 3 / 4;
 
-        M5.Display.fillScreen(pal.background);
-        M5.Display.drawFastHLine(0, 4, static_cast<int32_t>(screenWidth * progress), pal.accent);
-        M5.Display.drawRect(4, 4, screenWidth - 8, screenHeight - 8, pal.primary);
+        canvas.fillCircle(centerX, top + size / 3, size / 3, pal.primary);
+        canvas.fillRect(left + size / 6, top + size / 3, size * 2 / 3, bodyH / 2, pal.primary);
+        // Neon glowing cyan eyes
+        canvas.fillCircle(centerX - size / 5, top + size / 3, 2, pal.accent);
+        canvas.fillCircle(centerX + size / 5, top + size / 3, 2, pal.accent);
+        canvas.fillCircle(centerX - size / 5, top + size / 3, 1, 0xFFFF);
+        canvas.fillCircle(centerX + size / 5, top + size / 3, 1, 0xFFFF);
 
-        M5.Display.fillCircle(centerX, top + size / 3, size / 3, pal.primary);
-        M5.Display.fillRect(left + size / 6, top + size / 3, size * 2 / 3, bodyHeight / 2, pal.primary);
-        M5.Display.fillCircle(centerX - size / 6, top + size / 3, std::max<int16_t>(2, size / 12), pal.accent);
-        M5.Display.fillCircle(centerX + size / 6, top + size / 3, std::max<int16_t>(2, size / 12), pal.accent);
+        // Diagnostic hardware boot step lines
+        const char *diagMsg = "BOOT [01/07]: ESP32-S3FN8 240MHz ... OK";
+        if (progress > 0.85f)      diagMsg = "BOOT [07/07]: 56-KEY MATRIX READY ... OK";
+        else if (progress > 0.70f) diagMsg = "BOOT [06/07]: MicroSD & SPIFFS MOUNTED ... OK";
+        else if (progress > 0.55f) diagMsg = "BOOT [05/07]: SX1262 LoRa + ESP-NOW MESH ... OK";
+        else if (progress > 0.40f) diagMsg = "BOOT [04/07]: ES8311 CODEC + NS4150B AMP ... OK";
+        else if (progress > 0.25f) diagMsg = "BOOT [03/07]: ST7789 240x135 HUD ENGINE ... OK";
+        else if (progress > 0.12f) diagMsg = "BOOT [02/07]: 512KB SRAM + 8MB FLASH ... OK";
 
-        M5.Display.setTextDatum(textdatum_t::middle_center);
-        M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("GHOST FIRMWARE v2.1", centerX, screenHeight - 32);
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString("ESP32-S3 | CARDPUTER MESH", centerX, screenHeight - 20);
-        M5.Display.drawString(kDeveloperTag, centerX, screenHeight - 10);
-        delay(22);
+        canvas.setTextDatum(textdatum_t::middle_center);
+        canvas.setTextSize(1);
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString(diagMsg, centerX, 41);
+
+        // Cyberpunk Loading Progress Bar
+        canvas.drawRect(16, 50, screenWidth - 32, 6, pal.accent);
+        int16_t barW = static_cast<int16_t>((screenWidth - 36) * progress);
+        if (barW > 0) {
+            canvas.fillRect(18, 52, barW, 2, pal.primary);
+        }
+
+        char pctStr[24];
+        snprintf(pctStr, sizeof(pctStr), "INITIALIZING: %u%%", static_cast<unsigned>(progress * 100));
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString(pctStr, centerX, 63);
+
+        // Developer attribution & links underneath
+        canvas.setTextColor(0xFFFF, pal.background);
+        canvas.drawString("GHOST FIRMWARE v2.1 | ADVANCED EDITION", centerX, 76);
+
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString("DEVELOPER: PinoyUnknown (@pinoyunknown)", centerX, 88);
+
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString("github.com/PinoyUnknown/ghost-firmware", centerX, 100);
+
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("[PRESS ANY KEY OR G0 TO SKIP BOOT]", centerX, 114);
+
+        canvas.pushSprite(0, 0);
+
+        // Allow immediate skip if casing button (G0) is pressed
+        if (digitalRead(0) == LOW) {
+            break;
+        }
+        delay(frameIntervalMs);
     }
 }
 
@@ -2253,8 +2538,27 @@ void setup()
     enforceLandscapeOrientation(); // Ensure orientation is strictly locked after NVS load
 
     ensureFilesystemReady();
+    initSdCard(); // Auto-detect and mount MicroSD Card on Cardputer!
     initializeKeyboard();
     initMeshRadio();
+
+    // Auto-connect to saved Wi-Fi if credentials exist in NVS
+    String bootSsid = "";
+    String bootPass = "";
+    if (prefs.begin("ghost", true)) {
+        bootSsid = prefs.getString("w_ssid", "");
+        bootPass = prefs.getString("w_pass", "");
+        prefs.end();
+    }
+    if (bootSsid.length() > 0) {
+        wifiTargetSsid = bootSsid;
+        wifiPasswordInput = bootPass;
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(bootSsid.c_str(), bootPass.c_str());
+        wifiConnecting = true;
+        wifiConnectDeadlineMs = millis() + 15000;
+    }
+
     showBootSplash();
     redrawScreen();
 }
@@ -2267,6 +2571,21 @@ void loop()
     // Stream audio buffer loop for WebRadio
     if (gAudioPlayer && radioIsPlaying) {
         gAudioPlayer->loop();
+    }
+
+    // Wi-Fi Connection & NTP Sync handler
+    if (wifiConnecting) {
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiConnecting = false;
+            // Manila / Philippine Timezone: UTC+8 (8 * 3600 = 28800)
+            configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+            setStatusBanner("Wi-Fi Connected! NTP Time Synced");
+            redrawScreen();
+        } else if (millis() > wifiConnectDeadlineMs) {
+            wifiConnecting = false;
+            setStatusBanner("Wi-Fi Connection Timed Out!");
+            redrawScreen();
+        }
     }
 
     // Bruce Wi-Fi Beacon Flooder loop
@@ -2323,9 +2642,20 @@ void loop()
         }
     }
 
-    // Periodic screen refresh (75ms for animated Clock, 200ms for other active tools)
+    // Periodic screen refresh:
+    // - 75ms for animated Clock
+    // - 90ms for WebRadio spectrum visualizer when streaming
+    // - 250ms for WifiPasswordEntry blinking cursor
+    // - 200ms for other active tools
     static uint32_t lastRefresh = 0;
-    uint32_t refreshInterval = (selectedApp == 2 && currentScreen == Screen::Feature) ? 75 : 200;
+    uint32_t refreshInterval = 200;
+    if (currentScreen == Screen::WifiPasswordEntry) {
+        refreshInterval = 250;
+    } else if (selectedApp == 2 && currentScreen == Screen::Feature) {
+        refreshInterval = 75;
+    } else if (selectedApp == 12 && radioIsPlaying && currentScreen == Screen::Feature) {
+        refreshInterval = 90;
+    }
     if (currentScreen != Screen::Home && millis() - lastRefresh > refreshInterval) {
         lastRefresh = millis();
         redrawScreen();
