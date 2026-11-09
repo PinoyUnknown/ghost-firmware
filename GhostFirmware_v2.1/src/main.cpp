@@ -194,7 +194,8 @@ enum class Screen : uint8_t {
     Feature,
     SurveyDetail,
     WifiPasswordEntry,
-    FilePreview
+    FilePreview,
+    CardIdEntry
 };
 
 enum class KeyboardDriver : uint8_t {
@@ -271,35 +272,209 @@ struct FileEntry {
 };
 
 // -----------------------------------------------------------------------------
-// WebRadio Station Database (Philippine Stations as DEFAULT)
+// WebRadio Station Database & Custom MicroSD Playlist Loader
 // -----------------------------------------------------------------------------
 struct RadioStation {
-    const char *name;
-    const char *url;
-    const char *freq;
-    const char *region;
-    const char *genre;
+    char name[36];
+    char url[140];
+    char freq[16];
+    char region[8];
+    char genre[28];
 };
 
-constexpr RadioStation kRadioStations[] = {
+constexpr size_t kMaxRadioStations = 32;
+static RadioStation gRadioStations[kMaxRadioStations];
+static size_t gRadioStationCount = 0;
+static bool radioStationListOpen = false;
+static uint8_t radioStationListCursor = 0;
+
+void initDefaultRadioStations()
+{
+    gRadioStationCount = 0;
     // PHILIPPINE RADIO STATIONS (DEFAULT)
-    {"DWIZ 882 Manila",     "http://dwizmanila.radioca.st/stream",               "882 kHz AM",   "PH", "News & Talk (Aliw)"},
-    {"DZRH 666 Manila",     "http://stream.zeno.fm/f920ghk8vkeuv",               "666 kHz AM",   "PH", "News Nationwide (MBC)"},
-    {"Monster RX 93.1",     "http://icecast.eradioportal.com:8000/rx931_manila", "93.1 MHz FM",  "PH", "Top 40 & Pinoy Hits"},
-    {"Love Radio 90.7",     "http://stream.zeno.fm/s4k81v76w4zuv",               "90.7 MHz FM",  "PH", "OPM & Love Songs"},
-    {"Wish 107.5 Manila",   "http://stream.zeno.fm/0r0xa792kwzuv",               "107.5 MHz FM", "PH", "Pinoy Wish Bus & OPM"},
-    {"Star FM 102.7",       "http://stream.zeno.fm/a816p2v4w4zuv",               "102.7 MHz FM", "PH", "Pinoy Pop & Trending"},
-    {"Yes The Best 101.1",  "http://stream.zeno.fm/cvu4v626w4zuv",               "101.1 MHz FM", "PH", "Manila Mass Hits"},
-    {"Pinoy Classic OPM",   "http://stream.zeno.fm/uDkifg",                      "Web Stream",   "PH", "Classic Golden OPM"},
+    strncpy(gRadioStations[0].name, "DWIZ 882 Manila", 35);
+    strncpy(gRadioStations[0].url, "http://dwizmanila.radioca.st/stream", 139);
+    strncpy(gRadioStations[0].freq, "882 kHz AM", 15);
+    strncpy(gRadioStations[0].region, "PH", 7);
+    strncpy(gRadioStations[0].genre, "News & Talk (Aliw)", 27);
+
+    strncpy(gRadioStations[1].name, "DZRH 666 Manila", 35);
+    strncpy(gRadioStations[1].url, "http://stream.zeno.fm/f920ghk8vkeuv", 139);
+    strncpy(gRadioStations[1].freq, "666 kHz AM", 15);
+    strncpy(gRadioStations[1].region, "PH", 7);
+    strncpy(gRadioStations[1].genre, "News Nationwide (MBC)", 27);
+
+    strncpy(gRadioStations[2].name, "Monster RX 93.1", 35);
+    strncpy(gRadioStations[2].url, "http://icecast.eradioportal.com:8000/rx931_manila", 139);
+    strncpy(gRadioStations[2].freq, "93.1 MHz FM", 15);
+    strncpy(gRadioStations[2].region, "PH", 7);
+    strncpy(gRadioStations[2].genre, "Top 40 & Pinoy Hits", 27);
+
+    strncpy(gRadioStations[3].name, "Love Radio 90.7", 35);
+    strncpy(gRadioStations[3].url, "http://stream.zeno.fm/s4k81v76w4zuv", 139);
+    strncpy(gRadioStations[3].freq, "90.7 MHz FM", 15);
+    strncpy(gRadioStations[3].region, "PH", 7);
+    strncpy(gRadioStations[3].genre, "OPM & Love Songs", 27);
+
+    strncpy(gRadioStations[4].name, "Wish 107.5 Manila", 35);
+    strncpy(gRadioStations[4].url, "http://stream.zeno.fm/0r0xa792kwzuv", 139);
+    strncpy(gRadioStations[4].freq, "107.5 MHz FM", 15);
+    strncpy(gRadioStations[4].region, "PH", 7);
+    strncpy(gRadioStations[4].genre, "Pinoy Wish Bus & OPM", 27);
+
+    strncpy(gRadioStations[5].name, "Star FM 102.7", 35);
+    strncpy(gRadioStations[5].url, "http://stream.zeno.fm/a816p2v4w4zuv", 139);
+    strncpy(gRadioStations[5].freq, "102.7 MHz FM", 15);
+    strncpy(gRadioStations[5].region, "PH", 7);
+    strncpy(gRadioStations[5].genre, "Pinoy Pop & Trending", 27);
+
+    strncpy(gRadioStations[6].name, "Yes The Best 101.1", 35);
+    strncpy(gRadioStations[6].url, "http://stream.zeno.fm/cvu4v626w4zuv", 139);
+    strncpy(gRadioStations[6].freq, "101.1 MHz FM", 15);
+    strncpy(gRadioStations[6].region, "PH", 7);
+    strncpy(gRadioStations[6].genre, "Manila Mass Hits", 27);
+
+    strncpy(gRadioStations[7].name, "Pinoy Classic OPM", 35);
+    strncpy(gRadioStations[7].url, "http://stream.zeno.fm/uDkifg", 139);
+    strncpy(gRadioStations[7].freq, "Web Stream", 15);
+    strncpy(gRadioStations[7].region, "PH", 7);
+    strncpy(gRadioStations[7].genre, "Classic Golden OPM", 27);
+
     // INTERNATIONAL RADIO STATIONS
-    {"DEF CON Radio",       "http://ice1.somafm.com/defcon-128-mp3",             "Online Cyber", "INT", "Hacker / Cyber Chill"},
-    {"SomaFM Groove Salad", "http://ice1.somafm.com/groovesalad-128-mp3",        "Online Synth", "INT", "Ambient / Chillout"},
-    {"Nightwave Plaza",     "http://ice1.somafm.com/vaporwaves-128-mp3",         "Vaporwave",    "INT", "Aesthetic Synthwave"},
-    {"SomaFM Secret Agent", "http://ice1.somafm.com/secretagent-128-mp3",        "Online Spy",   "INT", "Spy & Lounge Downtempo"},
-    {"BBC World Service",   "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service", "World News", "INT", "Global News & Analysis"},
-    {"KEXP 90.3 Seattle",   "http://live-aac-64.kexp.org/kexp64.aac",            "90.3 MHz FM",  "INT", "Indie & Alternative"}
-};
-constexpr size_t kRadioStationCount = sizeof(kRadioStations) / sizeof(kRadioStations[0]);
+    strncpy(gRadioStations[8].name, "DEF CON Radio", 35);
+    strncpy(gRadioStations[8].url, "http://ice1.somafm.com/defcon-128-mp3", 139);
+    strncpy(gRadioStations[8].freq, "Online Cyber", 15);
+    strncpy(gRadioStations[8].region, "INT", 7);
+    strncpy(gRadioStations[8].genre, "Hacker / Cyber Chill", 27);
+
+    strncpy(gRadioStations[9].name, "SomaFM Groove Salad", 35);
+    strncpy(gRadioStations[9].url, "http://ice1.somafm.com/groovesalad-128-mp3", 139);
+    strncpy(gRadioStations[9].freq, "Online Synth", 15);
+    strncpy(gRadioStations[9].region, "INT", 7);
+    strncpy(gRadioStations[9].genre, "Ambient / Chillout", 27);
+
+    strncpy(gRadioStations[10].name, "Nightwave Plaza", 35);
+    strncpy(gRadioStations[10].url, "http://radio.plaza.one/mp3", 139);
+    strncpy(gRadioStations[10].freq, "Vaporwave", 15);
+    strncpy(gRadioStations[10].region, "INT", 7);
+    strncpy(gRadioStations[10].genre, "Aesthetic Synthwave", 27);
+
+    strncpy(gRadioStations[11].name, "SomaFM Secret Agent", 35);
+    strncpy(gRadioStations[11].url, "http://ice1.somafm.com/secretagent-128-mp3", 139);
+    strncpy(gRadioStations[11].freq, "Online Spy", 15);
+    strncpy(gRadioStations[11].region, "INT", 7);
+    strncpy(gRadioStations[11].genre, "Spy & Lounge Downtempo", 27);
+
+    strncpy(gRadioStations[12].name, "BBC World Service", 35);
+    strncpy(gRadioStations[12].url, "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service", 139);
+    strncpy(gRadioStations[12].freq, "World News", 15);
+    strncpy(gRadioStations[12].region, "INT", 7);
+    strncpy(gRadioStations[12].genre, "Global News & Analysis", 27);
+
+    strncpy(gRadioStations[13].name, "KEXP 90.3 Seattle", 35);
+    strncpy(gRadioStations[13].url, "http://live-aac-64.kexp.org/kexp64.aac", 139);
+    strncpy(gRadioStations[13].freq, "90.3 MHz FM", 15);
+    strncpy(gRadioStations[13].region, "INT", 7);
+    strncpy(gRadioStations[13].genre, "Indie & Alternative", 27);
+
+    strncpy(gRadioStations[14].name, "Retro Synthwave 80s", 35);
+    strncpy(gRadioStations[14].url, "http://stream.zeno.fm/4wt8y2u2rshvv", 139);
+    strncpy(gRadioStations[14].freq, "Retrowave", 15);
+    strncpy(gRadioStations[14].region, "INT", 7);
+    strncpy(gRadioStations[14].genre, "Darksynth / Outrun", 27);
+
+    strncpy(gRadioStations[15].name, "Lofi Hip Hop Radio", 35);
+    strncpy(gRadioStations[15].url, "http://play.streamafrica.net/lofiradio", 139);
+    strncpy(gRadioStations[15].freq, "Lofi Beats", 15);
+    strncpy(gRadioStations[15].region, "INT", 7);
+    strncpy(gRadioStations[15].genre, "Chillhop & Beats", 27);
+
+    gRadioStationCount = 16;
+}
+
+void loadRadioPlaylist()
+{
+    initDefaultRadioStations();
+
+    // Check MicroSD card for /station_list.txt
+    if (sdCardMounted && !SD.exists("/station_list.txt")) {
+        File out = SD.open("/station_list.txt", FILE_WRITE);
+        if (out) {
+            for (size_t i = 0; i < gRadioStationCount; ++i) {
+                out.printf("%s,%s,%s,%s,%s\n",
+                    gRadioStations[i].name,
+                    gRadioStations[i].url,
+                    gRadioStations[i].freq,
+                    gRadioStations[i].region,
+                    gRadioStations[i].genre);
+            }
+            out.close();
+        }
+    }
+
+    File in;
+    if (sdCardMounted && SD.exists("/station_list.txt")) {
+        in = SD.open("/station_list.txt", FILE_READ);
+    } else if (SPIFFS.exists("/station_list.txt")) {
+        in = SPIFFS.open("/station_list.txt", "r");
+    }
+
+    if (in) {
+        size_t count = 0;
+        while (in.available() && count < kMaxRadioStations) {
+            String line = in.readStringUntil('\n');
+            line.trim();
+            if (line.length() < 5 || line.startsWith("#")) continue;
+
+            int c1 = line.indexOf(',');
+            if (c1 > 0) {
+                String name = line.substring(0, c1);
+                String rest = line.substring(c1 + 1);
+                int c2 = rest.indexOf(',');
+                String url, freq, reg, genre;
+                if (c2 > 0) {
+                    url = rest.substring(0, c2);
+                    String rest2 = rest.substring(c2 + 1);
+                    int c3 = rest2.indexOf(',');
+                    if (c3 > 0) {
+                        freq = rest2.substring(0, c3);
+                        String rest3 = rest2.substring(c3 + 1);
+                        int c4 = rest3.indexOf(',');
+                        if (c4 > 0) {
+                            reg = rest3.substring(0, c4);
+                            genre = rest3.substring(c4 + 1);
+                        } else {
+                            reg = rest3;
+                            genre = "Music";
+                        }
+                    } else {
+                        freq = rest2;
+                        reg = "CUSTOM";
+                        genre = "Web Radio";
+                    }
+                } else {
+                    url = rest;
+                    freq = "Web Stream";
+                    reg = "CUSTOM";
+                    genre = "Stream";
+                }
+                name.trim(); url.trim(); freq.trim(); reg.trim(); genre.trim();
+                if (name.length() > 0 && url.length() > 0) {
+                    strncpy(gRadioStations[count].name, name.c_str(), sizeof(gRadioStations[count].name) - 1);
+                    strncpy(gRadioStations[count].url, url.c_str(), sizeof(gRadioStations[count].url) - 1);
+                    strncpy(gRadioStations[count].freq, freq.c_str(), sizeof(gRadioStations[count].freq) - 1);
+                    strncpy(gRadioStations[count].region, reg.c_str(), sizeof(gRadioStations[count].region) - 1);
+                    strncpy(gRadioStations[count].genre, genre.c_str(), sizeof(gRadioStations[count].genre) - 1);
+                    count++;
+                }
+            }
+        }
+        in.close();
+        if (count > 0) {
+            gRadioStationCount = count;
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Meshtastic Protocol Wire Structures (LoRa Skills)
@@ -424,6 +599,134 @@ uint8_t spectrumChEnergy[14] = {0};
 // Button A single-button fallback
 bool btnAHandledLong = false;
 
+// -----------------------------------------------------------------------------
+// Audio Codec Hardware Control (ES8311 for Cardputer-Adv + NS4150B / NS4168)
+// -----------------------------------------------------------------------------
+static bool gEs8311Detected = false;
+
+static bool es8311Write(TwoWire &bus, uint8_t reg, uint8_t val)
+{
+    bus.beginTransmission(0x18);
+    bus.write(reg);
+    bus.write(val);
+    return (bus.endTransmission() == 0);
+}
+
+bool initEs8311Codec()
+{
+    // Try Cardputer-Adv internal I2C bus (SDA=8, SCL=9)
+    TwoWire wireAdv(1);
+    wireAdv.begin(8, 9, 100000);
+    wireAdv.beginTransmission(0x18);
+    bool onAdv = (wireAdv.endTransmission() == 0);
+
+    TwoWire &bus = onAdv ? wireAdv : Wire;
+    if (!onAdv) {
+        Wire.beginTransmission(0x18);
+        if (Wire.endTransmission() != 0) {
+            // Standard Cardputer with direct NS4168 amplifier
+            return false;
+        }
+    }
+
+    // ES8311 is present! Run complete power-up and DAC un-mute sequence:
+    es8311Write(bus, 0x00, 0x1F); // Soft reset
+    delay(20);
+    es8311Write(bus, 0x00, 0x00); // Clear reset
+    delay(20);
+
+    es8311Write(bus, 0x01, 0x30); // Enable clocks
+    es8311Write(bus, 0x02, 0x00); // Power up all circuits
+    es8311Write(bus, 0x03, 0x10); // Analog power up
+    es8311Write(bus, 0x04, 0x10); // Analog power up
+    es8311Write(bus, 0x05, 0x00); // Analog power up
+
+    es8311Write(bus, 0x06, 0x00); // Format: Standard I2S
+    es8311Write(bus, 0x07, 0x00); // 16-bit
+    es8311Write(bus, 0x08, 0xFF); // Slave mode
+    es8311Write(bus, 0x09, 0x0C); // I2S standard
+    es8311Write(bus, 0x0A, 0x00);
+
+    es8311Write(bus, 0x12, 0x00); // DAC unmute
+    es8311Write(bus, 0x13, 0x10); // DAC output gain
+    es8311Write(bus, 0x14, 0x1A); // Output driver
+    es8311Write(bus, 0x32, 0xBF); // Digital volume: 0 dB (Full clear volume)
+    es8311Write(bus, 0x37, 0x08); // Output config
+
+    gEs8311Detected = true;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Sub-1 GHz CC1101 & LoRa RF Suite State
+// -----------------------------------------------------------------------------
+static uint8_t subGhzFreqIndex = 1;     // Default: 433.92 MHz
+static uint8_t subGhzModIndex = 0;      // Default: OOK / ASK
+static uint8_t subGhzPresetIndex = 0;   // Default: Weather Stn
+static bool subGhzScanning = true;
+static int8_t subGhzRssi = -68;
+static uint8_t subGhzWaterfall[24] = {0};
+static uint32_t subGhzPacketCount = 142;
+static bool subGhzViewLora = false;     // TAB toggles LoRa vs CC1101
+
+constexpr const char *kSubGhzFreqs[4] = {"315.00 MHz", "433.92 MHz", "868.35 MHz", "915.00 MHz"};
+constexpr const char *kSubGhzMods[5] = {"OOK / ASK", "2-FSK", "4-FSK", "GFSK", "MSK"};
+constexpr const char *kSubGhzPresets[5] = {
+    "Weather Stn (Oregon/LaCrosse)",
+    "Smart Socket (PT2262/EV1527)",
+    "IoT Doorbell / Sensor",
+    "Garage Door / Barrier (Came)",
+    "Raw RF Carrier Sniffer"
+};
+
+// -----------------------------------------------------------------------------
+// 125 kHz RFID & 13.56 MHz NFC Suite State
+// -----------------------------------------------------------------------------
+static uint8_t rfidMode = 0; // 0 = 125kHz LF RFID, 1 = 13.56MHz HF NFC
+static uint8_t rfidCardType = 0; // 0 = EM4100, 1 = HID ProxCard II, 2 = Indala
+static uint8_t nfcTagType = 0;  // 0 = Mifare Classic 1K, 1 = NTAG213, 2 = Ultralight
+static char rfidActiveUid[32] = "01:02:03:04:05";
+static uint8_t rfidHidFacility = 104;
+static uint16_t rfidHidCardNum = 23841;
+static char nfcActiveUid[32] = "04:A1:B2:C3:D4";
+static bool rfidEmulating = false;
+static String manualCardInput = "";
+
+// -----------------------------------------------------------------------------
+// NRF24 / 2.4 GHz RF Spectrum State
+// -----------------------------------------------------------------------------
+static bool nrfSweepActive = true;
+static uint8_t nrfPeakHold[14] = {0};
+
+// -----------------------------------------------------------------------------
+// Infrared (IR) Remote & Receiver Learner State
+// -----------------------------------------------------------------------------
+static uint8_t irCategory = 0; // 0 = TV, 1 = AC, 2 = Projector, 3 = Learner
+static uint8_t irSelectedCmd = 0;
+static uint32_t irLearnedCode = 0x00FFA25D;
+static char irLearnedProtocol[24] = "NEC (32-bit)";
+
+// -----------------------------------------------------------------------------
+// GPS Satellite & Navigation Telemetry State
+// -----------------------------------------------------------------------------
+static bool gpsHasFix = true;
+static float gpsLat = 14.599512f;
+static float gpsLon = 120.984222f;
+static float gpsAlt = 18.5f;
+static float gpsSpeed = 0.0f;
+static float gpsHeading = 42.0f;
+static uint8_t gpsSatsLocked = 11;
+static float gpsHdop = 0.8f;
+static bool gpsFormatDms = true;
+
+// -----------------------------------------------------------------------------
+// File Preview State
+// -----------------------------------------------------------------------------
+static String previewFileName = "";
+static String previewLines[16];
+static size_t previewLineCount = 0;
+static size_t previewScrollPos = 0;
+
 // Forward Declarations
 const ColorPalette &activePalette();
 const NeonClockTheme &activeClockTheme();
@@ -547,7 +850,7 @@ void loadSettings()
         keyBeepEnabled = prefs.getBool("beep", true);
         meshChannel = prefs.getUChar("mchan", 1);
         screenRotation = prefs.getUChar("rot", 1); // Default: 1 (Landscape)
-        currentRadioStation = prefs.getUChar("rad_st", 0) % kRadioStationCount; // Default: 0 (DWIZ 882 Manila)
+        currentRadioStation = prefs.getUChar("rad_st", 0) % (gRadioStationCount > 0 ? gRadioStationCount : 16); // Default: 0 (DWIZ 882 Manila)
         radioVolume = prefs.getUChar("rad_vol", 12);
         meshFreqIndex = prefs.getUChar("mfreq", 0) % 4;
         clock12hMode = prefs.getBool("c_12h", false);
@@ -661,21 +964,26 @@ void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode)
 // -----------------------------------------------------------------------------
 void startWebRadio(size_t stationIdx)
 {
-    if (stationIdx >= kRadioStationCount) {
+    if (gRadioStationCount == 0) {
+        initDefaultRadioStations();
+    }
+    if (stationIdx >= gRadioStationCount) {
         stationIdx = 0;
     }
     currentRadioStation = static_cast<uint8_t>(stationIdx);
 
     if (WiFi.status() != WL_CONNECTED) {
         setStatusBanner("Wi-Fi Offline! Press C in CONNECT tool.");
-        if (keyBeepEnabled) {
-            M5.Speaker.tone(440, 150);
-            delay(180);
-            M5.Speaker.tone(880, 200);
-        }
         radioIsPlaying = false;
         return;
     }
+
+    // CRITICAL: Stop M5.Speaker so ESP32-audioI2S has exclusive control over I2S pins (41, 43, 42)
+    M5.Speaker.end();
+    delay(30);
+
+    // CRITICAL: Initialize ES8311 I2C codec if running on Cardputer-Adv
+    initEs8311Codec();
 
     if (!gAudioPlayer) {
         gAudioPlayer = new Audio();
@@ -684,15 +992,15 @@ void startWebRadio(size_t stationIdx)
         gAudioPlayer->setPinout(41, 43, 42);
     }
 
-    gRadioStationTitle = kRadioStations[currentRadioStation].name;
+    gRadioStationTitle = gRadioStations[currentRadioStation].name;
     gRadioStreamTitle = "Connecting...";
     gRadioBitrate = "128 kbps";
 
     gAudioPlayer->setVolume(radioIsMuted ? 0 : radioVolume);
-    gAudioPlayer->connecttohost(kRadioStations[currentRadioStation].url);
+    gAudioPlayer->connecttohost(gRadioStations[currentRadioStation].url);
     radioIsPlaying = true;
     radioConnectTimeMs = millis();
-    setStatusBanner("Buffering stream...");
+    setStatusBanner("Tuning stream...");
 }
 
 void stopWebRadio()
@@ -702,6 +1010,11 @@ void stopWebRadio()
     }
     radioIsPlaying = false;
     gRadioStreamTitle = "Stopped";
+    delay(20);
+    // Re-enable M5.Speaker for normal UI beeps
+    if (keyBeepEnabled) {
+        M5.Speaker.begin();
+    }
     setStatusBanner("Radio Stopped");
 }
 
@@ -1337,21 +1650,29 @@ void drawWebRadioScreen()
     drawHeaderBar("WEBRADIO : CYBER BROADCAST");
     canvas.setTextDatum(textdatum_t::top_left);
 
+    if (gRadioStationCount == 0) {
+        initDefaultRadioStations();
+    }
+    if (currentRadioStation >= gRadioStationCount) {
+        currentRadioStation = 0;
+    }
+
     // 1. Station Card Box
     canvas.drawRect(4, 18, screenWidth - 8, 48, pal.accent);
     canvas.drawFastHLine(4, 34, screenWidth - 8, pal.accent);
 
-    const RadioStation &st = kRadioStations[currentRadioStation];
+    const RadioStation &st = gRadioStations[currentRadioStation];
     canvas.setTextColor(pal.primary, pal.background);
     char stHeader[48];
     snprintf(stHeader, sizeof(stHeader), "[%02u/%02u] %s", static_cast<unsigned>(currentRadioStation + 1),
-             static_cast<unsigned>(kRadioStationCount), st.name);
+             static_cast<unsigned>(gRadioStationCount), st.name);
     canvas.drawString(stHeader, 8, 22);
 
     // Region & Genre Badge
     canvas.setTextDatum(textdatum_t::top_right);
-    canvas.setTextColor(strcmp(st.region, "PH") == 0 ? 0x07E0 : pal.accent, pal.background);
-    canvas.drawString(strcmp(st.region, "PH") == 0 ? "[PH - DEFAULT]" : "[INT REGION]", screenWidth - 8, 22);
+    bool isPh = (strcmp(st.region, "PH") == 0);
+    canvas.setTextColor(isPh ? 0x07E0 : pal.accent, pal.background);
+    canvas.drawString(isPh ? "[PH - DEFAULT]" : "[INT REGION]", screenWidth - 8, 22);
 
     canvas.setTextDatum(textdatum_t::top_left);
     canvas.setTextColor(pal.text, pal.background);
@@ -1370,7 +1691,7 @@ void drawWebRadioScreen()
     for (int x = 8; x < screenWidth - 8; x += 16) {
         canvas.drawFastVLine(x, dialY + 3, 6, pal.accent);
     }
-    int16_t needleX = 8 + (screenWidth - 24) * currentRadioStation / (kRadioStationCount - 1);
+    int16_t needleX = 8 + (screenWidth - 24) * currentRadioStation / (gRadioStationCount > 1 ? (gRadioStationCount - 1) : 1);
     canvas.fillRect(needleX - 2, dialY + 1, 5, 10, pal.primary);
 
     // 3. Cyberpunk Animated Audio Spectrum Visualizer (16 bars)
@@ -1396,7 +1717,7 @@ void drawWebRadioScreen()
     // 4. Status and Volume indicator
     canvas.setTextDatum(textdatum_t::top_left);
     canvas.setTextColor(radioIsPlaying ? 0x07E0 : 0xF800, pal.background);
-    canvas.drawString(radioIsPlaying ? "[● STREAMING]" : "[■ STOPPED]", 8, 114);
+    canvas.drawString(radioIsPlaying ? "[● ON AIR]" : "[■ STOPPED]", 8, 114);
 
     char volStr[32];
     snprintf(volStr, sizeof(volStr), "VOL: %u%% %s", (radioVolume * 100) / 21, radioIsMuted ? "(MUTED)" : "");
@@ -1404,7 +1725,51 @@ void drawWebRadioScreen()
     canvas.setTextColor(pal.accent, pal.background);
     canvas.drawString(volStr, screenWidth - 8, 114);
 
-    drawFooter("ENTER:PLAY/STOP  A/D:CH  W/S:VOL  M:MUTE  ESC:HOME");
+    // 5. Station List Popup (toggled with 'L')
+    if (radioStationListOpen) {
+        int16_t popX = 10;
+        int16_t popY = 16;
+        int16_t popW = screenWidth - 20;
+        int16_t popH = screenHeight - 32;
+
+        canvas.fillRect(popX, popY, popW, popH, 0x0000);
+        canvas.drawRect(popX, popY, popW, popH, pal.accent);
+        canvas.drawRect(popX + 2, popY + 2, popW - 4, popH - 4, pal.primary);
+
+        canvas.setTextDatum(textdatum_t::top_left);
+        canvas.setTextColor(pal.primary, 0x0000);
+        canvas.drawString("SELECT RADIO STATION (L:CLOSE)", popX + 8, popY + 6);
+        canvas.drawFastHLine(popX + 4, popY + 18, popW - 8, pal.accent);
+
+        size_t startIdx = (radioStationListCursor > 2) ? (radioStationListCursor - 2) : 0;
+        if (startIdx + 5 > gRadioStationCount && gRadioStationCount >= 5) {
+            startIdx = gRadioStationCount - 5;
+        }
+
+        for (size_t i = 0; i < 5 && (startIdx + i) < gRadioStationCount; ++i) {
+            size_t idx = startIdx + i;
+            bool sel = (idx == radioStationListCursor);
+            int16_t ry = popY + 22 + i * 14;
+            if (sel) {
+                canvas.fillRect(popX + 4, ry - 1, popW - 8, 13, pal.accent);
+                canvas.setTextColor(pal.background, pal.accent);
+            } else {
+                canvas.setTextColor(pal.text, 0x0000);
+            }
+            char stRow[48];
+            snprintf(stRow, sizeof(stRow), "%02u. [%s] %.22s",
+                     static_cast<unsigned>(idx + 1),
+                     gRadioStations[idx].region,
+                     gRadioStations[idx].name);
+            canvas.drawString(stRow, popX + 8, ry);
+        }
+
+        canvas.drawFastHLine(popX + 4, popY + popH - 16, popW - 8, pal.accent);
+        canvas.setTextColor(pal.primary, 0x0000);
+        canvas.drawString("UP/DOWN:NAV  ENTER:TUNE  ESC:CLOSE", popX + 8, popY + popH - 12);
+    }
+
+    drawFooter("ENTER:PLAY  A/D:CH  W/S:VOL  M:MUTE  L:LIST  ESC:HOME");
 }
 
 // -----------------------------------------------------------------------------
@@ -1471,7 +1836,7 @@ void drawConfigScreen()
     snprintf(rows[2], sizeof(rows[2]), "Brightness  : %u%%", kBrightnessPcts[brightnessStep & 3]);
     snprintf(rows[3], sizeof(rows[3]), "Key Beep    : %s", keyBeepEnabled ? "ON" : "OFF");
     snprintf(rows[4], sizeof(rows[4]), "Orientation : %s", screenRotation == 1 ? "LANDSCAPE (1)" : "LANDSCAPE FLIP (3)");
-    snprintf(rows[5], sizeof(rows[5]), "Radio Region: %s", strcmp(kRadioStations[currentRadioStation].region, "PH") == 0 ? "PHILIPPINES (DEFAULT)" : "INTERNATIONAL");
+    snprintf(rows[5], sizeof(rows[5]), "Radio Region: %s", (gRadioStationCount > 0 && strcmp(gRadioStations[currentRadioStation].region, "PH") == 0) ? "PHILIPPINES (DEFAULT)" : "INTERNATIONAL");
     snprintf(rows[6], sizeof(rows[6]), "Mesh Freq   : %s", kMeshFreqNames[meshFreqIndex % 4]);
     snprintf(rows[7], sizeof(rows[7]), "Reset Defaults");
 
@@ -1923,6 +2288,64 @@ void loadFileList()
     selectedFile = 0;
 }
 
+void openSelectedFile()
+{
+    if (fileEntryCount == 0 || selectedFile >= fileEntryCount) return;
+
+    const FileEntry &entry = fileEntries[selectedFile];
+    if (entry.isDirectory) {
+        if (entry.path.startsWith("/")) {
+            currentDirectory = entry.path;
+        } else {
+            currentDirectory = (currentDirectory == "/") ? ("/" + entry.path) : (currentDirectory + "/" + entry.path);
+        }
+        selectedFile = 0;
+        loadFileList();
+        redrawScreen();
+        return;
+    }
+
+    // It is a file! Read up to 16 lines for preview
+    String fname = entry.path;
+    int slash = fname.lastIndexOf('/');
+    if (slash >= 0) {
+        fname = fname.substring(slash + 1);
+    }
+    previewFileName = fname;
+    previewLineCount = 0;
+    previewScrollPos = 0;
+
+    String fullPath = entry.path;
+    if (!fullPath.startsWith("/")) {
+        fullPath = (currentDirectory == "/") ? ("/" + fullPath) : (currentDirectory + "/" + fullPath);
+    }
+
+    File f;
+    if (useSdCard && sdCardMounted) {
+        f = SD.open(fullPath.c_str(), FILE_READ);
+    } else {
+        ensureFilesystemReady();
+        f = SPIFFS.open(fullPath.c_str(), "r");
+    }
+
+    if (f) {
+        while (f.available() && previewLineCount < 16) {
+            String line = f.readStringUntil('\n');
+            line.trim();
+            if (line.length() > 0 || previewLineCount > 0) {
+                previewLines[previewLineCount++] = line;
+            }
+        }
+        f.close();
+    } else {
+        previewLines[0] = "Error opening file.";
+        previewLineCount = 1;
+    }
+
+    currentScreen = Screen::FilePreview;
+    redrawScreen();
+}
+
 void runHardwareSelfTest()
 {
     selfTestLogCount = 0;
@@ -1998,48 +2421,401 @@ void drawMiscTelemetry()
     drawFooter("PAGE 1/2  W/S:SWITCH  ESC:HOME");
 }
 
-void drawPeripheralBusScreen()
+// -----------------------------------------------------------------------------
+// Module 5: Sub-1 GHz CC1101 Transceiver & RF Analyzer
+// -----------------------------------------------------------------------------
+void drawSubGhzRfScreen()
 {
+    if (subGhzViewLora) {
+        drawMeshRfScreen();
+        return;
+    }
+
     const ColorPalette &pal = activePalette();
-    drawHeaderBar(themeImages[selectedApp].name);
+    drawHeaderBar("SUB-1GHz RF : CC1101 TRANSCEIVER");
     canvas.setTextDatum(textdatum_t::top_left);
 
-    if (selectedApp == 6) { // NRF / 2.4GHz Spectrum
-        canvas.setTextColor(pal.primary, pal.background);
-        canvas.drawString("2.4GHz RF SPECTRUM ENERGY (CH 1-14)", 5, 20);
+    // 1. Channel & Modulation Bar
+    char statLine[56];
+    snprintf(statLine, sizeof(statLine), "FREQ: %s | MOD: %s",
+             kSubGhzFreqs[subGhzFreqIndex % 4], kSubGhzMods[subGhzModIndex % 5]);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString(statLine, 6, 18);
 
-        for (uint8_t ch = 0; ch < 14; ++ch) {
-            spectrumChEnergy[ch] = (spectrumChEnergy[ch] * 3 + random(10, 85)) / 4;
-            int16_t bx = 8 + ch * 16;
-            int16_t barH = spectrumChEnergy[ch] * 55 / 100;
-            canvas.fillRect(bx, 105 - barH, 12, barH, (ch == 5 || ch == 10) ? 0xF81F : pal.accent);
-            canvas.drawFastHLine(bx, 105 - barH - 1, 12, pal.primary);
+    snprintf(statLine, sizeof(statLine), "PRESET: %.24s", kSubGhzPresets[subGhzPresetIndex % 5]);
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString(statLine, 6, 30);
 
-            char chLabel[4];
-            snprintf(chLabel, sizeof(chLabel), "%u", ch + 1);
-            canvas.drawString(chLabel, bx + 1, 108);
+    // 2. Live RF Waterfall / Signal Carrier graph (24 bars)
+    int16_t wfY = 44;
+    int16_t wfH = 26;
+    canvas.drawRect(4, wfY - 2, screenWidth - 8, wfH + 4, pal.accent);
+
+    for (uint8_t i = 0; i < 24; ++i) {
+        if (subGhzScanning) {
+            subGhzWaterfall[i] = (subGhzWaterfall[i] * 2 + random(8, 24)) / 3;
         }
-        drawFooter("LIVE SCANNING 2.4GHz BAND  ESC:HOME");
-    } else if (selectedApp == 7) { // NFC / RFID
-        canvas.setTextColor(pal.primary, pal.background);
-        canvas.drawString("NFC / RFID SCANNER (PN532 / RC522 I2C)", 5, 22);
-        canvas.setTextColor(pal.text, pal.background);
-        canvas.drawString("I2C Scanner: Scanning 0x24 (PN532) & 0x28 (RC522)...", 5, 38);
-        canvas.drawString("STATUS : READY TO SNIFF CARD UID", 5, 54);
-        canvas.drawString("Supported: Mifare Classic 1K/4K, Ultralight, NTAG213", 5, 70);
-        drawFooter("R:SCAN BUS  ESC:HOME");
-    } else if (selectedApp == 11) { // GPS
-        canvas.setTextColor(pal.primary, pal.background);
-        canvas.drawString("GROVE NMEA GPS RECEIVER (9600 BAUD)", 5, 22);
-        canvas.setTextColor(pal.text, pal.background);
-        canvas.drawString("LATITUDE  : 14.599512 N", 5, 38);
-        canvas.drawString("LONGITUDE : 120.984222 E", 5, 52);
-        canvas.drawString("ALTITUDE  : 16.2 m | SATELLITES: 8 LOCK", 5, 66);
-        canvas.drawString("SPEED     : 0.0 km/h | HDOP: 0.9 (GOOD)", 5, 80);
-        drawFooter("R:RECONNECT  ESC:HOME");
-    } else {
-        drawConnectScreen();
+        int16_t bx = 8 + i * 9;
+        int16_t bh = subGhzWaterfall[i];
+        if (bh > wfH) bh = wfH;
+        uint16_t bCol = (bh > 20) ? 0xF81F : ((bh > 14) ? pal.primary : 0x07E0);
+        canvas.fillRect(bx, (wfY + wfH) - bh, 7, bh, bCol);
     }
+
+    // 3. Decoded Telemetry Monitor
+    int16_t monY = 76;
+    canvas.drawRect(4, monY, screenWidth - 8, 38, pal.accent);
+    canvas.drawFastHLine(4, monY + 12, screenWidth - 8, pal.accent);
+
+    canvas.setTextColor(0x07E0, pal.background);
+    char rxHeader[48];
+    snprintf(rxHeader, sizeof(rxHeader), "[RX #%lu] %s | RSSI: %ddBm",
+             static_cast<unsigned long>(subGhzPacketCount),
+             subGhzScanning ? "DECODING" : "PAUSED",
+             subGhzRssi);
+    canvas.drawString(rxHeader, 6, monY + 2);
+
+    canvas.setTextColor(pal.primary, pal.background);
+    if (subGhzPresetIndex == 0) { // Weather Station
+        canvas.drawString("DEV: OREGON v2.1 | ID: 0x4F | CH: 1 | BATT: OK", 6, monY + 14);
+        canvas.drawString("TEMP: 28.4 C | HUMIDITY: 62% | SYNC: 0xD391", 6, monY + 26);
+    } else if (subGhzPresetIndex == 1) { // Smart Socket
+        canvas.drawString("DEV: PT2262 / EV1527 | ADDR: 0xA59F2 | CH: A", 6, monY + 14);
+        canvas.drawString("COMMAND: POWER ON | PULSE: 320us | PREAMBLE: 1:31", 6, monY + 26);
+    } else if (subGhzPresetIndex == 2) { // IoT Doorbell
+        canvas.drawString("DEV: BYRON / KERUI WIRELESS DOORBELL | CH: 3", 6, monY + 14);
+        canvas.drawString("EVENT: CHIME RING | ROLLING CODE: #10492", 6, monY + 26);
+    } else if (subGhzPresetIndex == 3) { // Garage Barrier
+        canvas.drawString("DEV: CAME TAM 433 / NICE FIXED CODE BARRIER", 6, monY + 14);
+        canvas.drawString("ID: 0x38F2B | BTN: GATE OPEN | 24-bit OOK", 6, monY + 26);
+    } else { // Raw Carrier Sniffer
+        canvas.drawString("RAW PREAMBLE: 0x555555 | SYNC WORD: 0xD391", 6, monY + 14);
+        canvas.drawString("PAYLOAD: 4F 2A 10 9C 00 E4 78 B2 31 40 55 AA", 6, monY + 26);
+    }
+
+    drawFooter("F:FREQ  M:MOD  P:PRESET  T:TX  TAB:LORA  ESC:HOME");
+}
+
+// -----------------------------------------------------------------------------
+// Module 6: NRF24 / 2.4 GHz RF Spectrum Analyzer
+// -----------------------------------------------------------------------------
+void drawNrfSpectrumScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("NRF24 / 2.4GHz RF SPECTRUM");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString("2.4GHz RF SPECTRUM ENERGY (CH 1-14)", 6, 18);
+
+    // Spectrum bars
+    for (uint8_t ch = 0; ch < 14; ++ch) {
+        if (nrfSweepActive) {
+            uint8_t noise = random(10, 85);
+            if (ch == 5 || ch == 10) noise += 15; // Wi-Fi Ch 6 & 11 interference
+            if (noise > 95) noise = 95;
+            spectrumChEnergy[ch] = (spectrumChEnergy[ch] * 3 + noise) / 4;
+            if (spectrumChEnergy[ch] > nrfPeakHold[ch]) {
+                nrfPeakHold[ch] = spectrumChEnergy[ch];
+            } else if (nrfPeakHold[ch] > 0 && (millis() % 5 == 0)) {
+                nrfPeakHold[ch]--;
+            }
+        }
+        int16_t bx = 8 + ch * 16;
+        int16_t barH = spectrumChEnergy[ch] * 50 / 100;
+        uint16_t barCol = (ch == 0 || ch == 5 || ch == 10) ? 0xF81F : ((ch == 1 || ch == 6 || ch == 12) ? 0x07FF : pal.accent);
+        canvas.fillRect(bx, 90 - barH, 12, barH, barCol);
+        // Peak hold line
+        int16_t pkH = nrfPeakHold[ch] * 50 / 100;
+        canvas.drawFastHLine(bx, 90 - pkH, 12, 0xFFFF);
+
+        char chLabel[4];
+        snprintf(chLabel, sizeof(chLabel), "%u", ch + 1);
+        canvas.setTextColor(pal.text, pal.background);
+        canvas.drawString(chLabel, bx + 1, 94);
+    }
+
+    // Legend & stats
+    canvas.drawFastHLine(4, 106, screenWidth - 8, pal.accent);
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString("PINK:WiFi(1/6/11) CYAN:BLE  PK:CH6 -48dBm", 6, 110);
+
+    drawFooter("S:SWEEP  C:LOCK  R:RESET PEAKS  ESC:HOME");
+}
+
+// -----------------------------------------------------------------------------
+// Module 7: 125 kHz RFID & 13.56 MHz NFC Suite
+// -----------------------------------------------------------------------------
+void drawNfcRfidScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("125kHz RFID & 13.56MHz NFC SUITE");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    // 1. Dual-Frequency Tab Headers
+    int16_t tabW = (screenWidth - 12) / 2;
+    canvas.drawRect(4, 18, tabW, 14, (rfidMode == 0) ? pal.primary : pal.accent);
+    if (rfidMode == 0) canvas.fillRect(5, 19, tabW - 2, 12, pal.accent);
+    canvas.setTextColor((rfidMode == 0) ? pal.background : pal.accent, (rfidMode == 0) ? pal.accent : pal.background);
+    canvas.drawString("[1] 125kHz LF RFID", 8, 20);
+
+    canvas.drawRect(6 + tabW, 18, tabW, 14, (rfidMode == 1) ? pal.primary : pal.accent);
+    if (rfidMode == 1) canvas.fillRect(7 + tabW, 19, tabW - 2, 12, pal.accent);
+    canvas.setTextColor((rfidMode == 1) ? pal.background : pal.accent, (rfidMode == 1) ? pal.accent : pal.background);
+    canvas.drawString("[2] 13.56MHz HF NFC", 10 + tabW, 20);
+
+    // 2. Graphic Card Illustration
+    canvas.drawRect(4, 34, screenWidth - 8, 54, pal.accent);
+    canvas.drawRect(6, 36, screenWidth - 12, 50, pal.primary);
+
+    // Smart Card Chip Graphic
+    canvas.drawRect(12, 42, 28, 22, 0xFFE0);
+    canvas.fillRect(14, 44, 24, 18, 0x8400);
+    canvas.drawFastHLine(14, 50, 24, 0xFFE0);
+    canvas.drawFastHLine(14, 56, 24, 0xFFE0);
+    canvas.drawFastVLine(26, 44, 18, 0xFFE0);
+
+    // Card Details
+    canvas.setTextColor(0xFFFF, pal.background);
+    if (rfidMode == 0) {
+        canvas.drawString("125kHz PROXIMITY CARD", 46, 40);
+        canvas.setTextColor(pal.primary, pal.background);
+        char uidLine[48];
+        snprintf(uidLine, sizeof(uidLine), "UID: %s (EM4100)", rfidActiveUid);
+        canvas.drawString(uidLine, 46, 52);
+        char hidLine[48];
+        snprintf(hidLine, sizeof(hidLine), "HID 26-bit: FC:%u CN:%u", rfidHidFacility, rfidHidCardNum);
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString(hidLine, 46, 64);
+        canvas.drawString("CLONE & EMULATION: READY", 46, 76);
+    } else {
+        canvas.drawString("13.56MHz HIGH-FREQ NFC", 46, 40);
+        canvas.setTextColor(pal.primary, pal.background);
+        char uidLine[48];
+        snprintf(uidLine, sizeof(uidLine), "UID: %s (MIFARE 1K)", nfcActiveUid);
+        canvas.drawString(uidLine, 46, 52);
+        canvas.setTextColor(pal.accent, pal.background);
+        canvas.drawString("ATQA: 0x0004 | SAK: 0x08 | 1024B", 46, 64);
+        canvas.drawString("NDEF DUMP TO SD: READY", 46, 76);
+    }
+
+    // 3. Emulation / Broadcast status
+    int16_t stY = 92;
+    canvas.drawRect(4, stY, screenWidth - 8, 20, pal.accent);
+    canvas.setTextColor(rfidEmulating ? 0x07E0 : pal.accent, pal.background);
+    canvas.drawString(rfidEmulating ? "EMULATION ACTIVE : TRANSMITTING TAG" : "HARDWARE STANDBY : READY TO SCAN", 8, stY + 4);
+
+    drawFooter("R:SCAN  E:EMULATE  M:MANUAL ID  S:SAVE SD  TAB:MODE");
+}
+
+// -----------------------------------------------------------------------------
+// Module 10: Infrared (IR) Remote & Receiver Learner
+// -----------------------------------------------------------------------------
+void drawIrApplianceScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("INFRARED : APPLIANCE REMOTE");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    // Category Selector
+    constexpr const char *kIrCats[4] = {"[1] TV", "[2] AIRCON", "[3] PROJ", "[4] LEARN"};
+    for (uint8_t c = 0; c < 4; ++c) {
+        int16_t bx = 4 + c * 58;
+        bool active = (irCategory == c);
+        canvas.drawRect(bx, 18, 56, 12, active ? pal.primary : pal.accent);
+        if (active) canvas.fillRect(bx + 1, 19, 54, 10, pal.accent);
+        canvas.setTextColor(active ? pal.background : pal.accent, active ? pal.accent : pal.background);
+        canvas.drawString(kIrCats[c], bx + 4, 19);
+    }
+
+    // Command List
+    if (irCategory == 0) { // TV
+        constexpr const char *kTvCmds[8] = {
+            "1. SONY POWER TOGGLE", "2. SAMSUNG POWER TOGGLE", "3. LG POWER TOGGLE",
+            "4. VOLUME UP (+)",      "5. VOLUME DOWN (-)",       "6. MUTE TOGGLE",
+            "7. CHANNEL UP (+)",    "8. SOURCE / HDMI INPUT"
+        };
+        for (uint8_t i = 0; i < 6; ++i) {
+            bool sel = (i == irSelectedCmd);
+            int16_t y = 34 + i * 13;
+            if (sel) {
+                canvas.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
+                canvas.setTextColor(pal.background, pal.accent);
+            } else {
+                canvas.setTextColor(pal.text, pal.background);
+            }
+            canvas.drawString(kTvCmds[i], 8, y);
+        }
+    } else if (irCategory == 1) { // AC
+        constexpr const char *kAcCmds[6] = {
+            "1. DAIKIN POWER ON (24C)", "2. DAIKIN POWER OFF",
+            "3. MITSUBISHI COOL (22C)", "4. PANASONIC POWER ON",
+            "5. TEMP UP (+1 C)",        "6. FAN SPEED TURBO"
+        };
+        for (uint8_t i = 0; i < 6; ++i) {
+            bool sel = (i == irSelectedCmd);
+            int16_t y = 34 + i * 13;
+            if (sel) {
+                canvas.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
+                canvas.setTextColor(pal.background, pal.accent);
+            } else {
+                canvas.setTextColor(pal.text, pal.background);
+            }
+            canvas.drawString(kAcCmds[i], 8, y);
+        }
+    } else if (irCategory == 2) { // Projector
+        constexpr const char *kProjCmds[6] = {
+            "1. EPSON POWER ON",     "2. EPSON POWER OFF",
+            "3. BENQ POWER TOGGLE",  "4. OPTOMA POWER ON",
+            "5. HDMI 1 SOURCE",      "6. SCREEN FREEZE"
+        };
+        for (uint8_t i = 0; i < 6; ++i) {
+            bool sel = (i == irSelectedCmd);
+            int16_t y = 34 + i * 13;
+            if (sel) {
+                canvas.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
+                canvas.setTextColor(pal.background, pal.accent);
+            } else {
+                canvas.setTextColor(pal.text, pal.background);
+            }
+            canvas.drawString(kProjCmds[i], 8, y);
+        }
+    } else { // IR Learner
+        canvas.drawRect(4, 34, screenWidth - 8, 76, pal.accent);
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString("IR RECEIVER / LEARNER (GPIO 44)", 8, 38);
+        canvas.setTextColor(pal.primary, pal.background);
+        char prtLine[48];
+        snprintf(prtLine, sizeof(prtLine), "PROTOCOL: %s", irLearnedProtocol);
+        canvas.drawString(prtLine, 8, 52);
+        char hexLine[48];
+        snprintf(hexLine, sizeof(hexLine), "HEX CODE: 0x%08lX (38kHz)", static_cast<unsigned long>(irLearnedCode));
+        canvas.drawString(hexLine, 8, 66);
+        canvas.setTextColor(pal.text, pal.background);
+        canvas.drawString("Point remote at Cardputer & press any key", 8, 80);
+        canvas.drawString("Press S to save captured code to MicroSD", 8, 92);
+    }
+
+    drawFooter("1-4:CAT  W/S:CMD  ENTER:FIRE TX  S:SAVE  ESC:HOME");
+}
+
+// -----------------------------------------------------------------------------
+// Module 11: GPS Satellite & Navigation Telemetry
+// -----------------------------------------------------------------------------
+void drawGpsTelemetryScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("GPS : SATELLITE & NAVIGATION");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    // 1. Compass Rose Bar
+    int16_t compY = 18;
+    canvas.drawRect(4, compY, screenWidth - 8, 16, pal.accent);
+    canvas.fillRect(5, compY + 1, screenWidth - 10, 14, 0x0821);
+    canvas.setTextColor(0xFFFF, 0x0821);
+    canvas.drawString("[ N ]  NE   E   SE   S   SW   W   NW   HDG: 042*", 8, compY + 3);
+
+    // 2. Position Coordinates
+    canvas.setTextColor(pal.primary, pal.background);
+    if (gpsFormatDms) {
+        canvas.drawString("LAT: 14 deg 35' 58.2 N | LON: 120 deg 59' 03.1 E", 6, 38);
+    } else {
+        char coordLine[52];
+        snprintf(coordLine, sizeof(coordLine), "LAT: %.6f* N | LON: %.6f* E", gpsLat, gpsLon);
+        canvas.drawString(coordLine, 6, 38);
+    }
+
+    char altLine[52];
+    snprintf(altLine, sizeof(altLine), "ALT: %.1fm (%.1fft) | SPEED: %.1f km/h", gpsAlt, gpsAlt * 3.28084f, gpsSpeed);
+    canvas.setTextColor(pal.accent, pal.background);
+    canvas.drawString(altLine, 6, 52);
+
+    // 3. Satellite Constellation & Fix
+    canvas.drawRect(4, 66, screenWidth - 8, 44, pal.accent);
+    canvas.setTextColor(gpsHasFix ? 0x07E0 : 0xF800, pal.background);
+    char fixLine[48];
+    snprintf(fixLine, sizeof(fixLine), "FIX: %s | SATS: %u LOCKED | HDOP: %.1f",
+             gpsHasFix ? "3D DGPS FIX (OK)" : "ACQUIRING FIX...",
+             static_cast<unsigned>(gpsSatsLocked), gpsHdop);
+    canvas.drawString(fixLine, 8, 70);
+
+    // 12 Satellite Signal Strength Bars
+    for (uint8_t s = 0; s < 12; ++s) {
+        int16_t bx = 8 + s * 18;
+        int16_t sig = (s < 10) ? (20 + (s * 7) % 22) : 8;
+        uint16_t sCol = (s < 10) ? 0x07E0 : 0xFD20;
+        canvas.fillRect(bx, 102 - sig, 12, sig, sCol);
+        char sNum[4];
+        snprintf(sNum, sizeof(sNum), "%02u", s + 1);
+        canvas.setTextColor(pal.text, pal.background);
+        canvas.drawString(sNum, bx, 104);
+    }
+
+    drawFooter("U:UNITS(DMS/DEC)  S:SAVE WAYPOINT  R:REACQUIRE  ESC:HOME");
+}
+
+// -----------------------------------------------------------------------------
+// Sub-Screen: File Previewer
+// -----------------------------------------------------------------------------
+void drawFilePreviewScreen()
+{
+    const ColorPalette &pal = activePalette();
+    char header[48];
+    snprintf(header, sizeof(header), "PREVIEW: %.30s", previewFileName.c_str());
+    drawHeaderBar(header);
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    canvas.drawRect(2, 18, screenWidth - 4, screenHeight - 34, pal.accent);
+    canvas.setTextColor(pal.primary, pal.background);
+
+    if (previewLineCount == 0) {
+        canvas.drawString("(File is empty)", 8, 24);
+    } else {
+        for (size_t i = 0; i < 7 && (previewScrollPos + i) < previewLineCount; ++i) {
+            size_t lineIdx = previewScrollPos + i;
+            char lineBuf[56];
+            snprintf(lineBuf, sizeof(lineBuf), "%02u: %.44s", static_cast<unsigned>(lineIdx + 1), previewLines[lineIdx].c_str());
+            canvas.setTextColor((lineIdx % 2 == 0) ? pal.primary : pal.text, pal.background);
+            canvas.drawString(lineBuf, 6, 22 + i * 13);
+        }
+    }
+
+    drawFooter("W/S:SCROLL  ESC/DEL:BACK");
+}
+
+// -----------------------------------------------------------------------------
+// Sub-Screen: Manual Card ID Input (RFID / NFC)
+// -----------------------------------------------------------------------------
+void drawCardIdEntryScreen()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar(rfidMode == 0 ? "MANUAL 125kHz RFID ID ENTRY" : "MANUAL 13.56MHz NFC UID ENTRY");
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    canvas.drawRect(6, 24, screenWidth - 12, 80, pal.accent);
+    canvas.drawRect(8, 26, screenWidth - 16, 76, pal.primary);
+
+    canvas.setTextColor(pal.primary, pal.background);
+    canvas.drawString(rfidMode == 0 ? "ENTER 10-HEX RFID CARD ID:" : "ENTER 7-BYTE NFC HEX UID:", 14, 32);
+
+    // Text input box
+    canvas.drawRect(14, 48, screenWidth - 28, 20, pal.accent);
+    canvas.fillRect(15, 49, screenWidth - 30, 18, 0x0821);
+
+    canvas.setTextColor(0xFFFF, 0x0821);
+    bool showCursor = ((millis() / 350) % 2 == 0);
+    String inputWithCursor = manualCardInput + (showCursor ? "_" : " ");
+    canvas.drawString(inputWithCursor.c_str(), 18, 54);
+
+    canvas.setTextColor(pal.text, pal.background);
+    canvas.drawString("Ex: 0102030405 or 04:A1:B2:C3", 14, 76);
+
+    drawFooter("ENTER:APPLY  DEL:BACKSPACE  ESC:CANCEL");
+}
+
+void drawPeripheralBusScreen()
+{
+    drawConnectScreen();
 }
 
 void drawFeature()
@@ -2047,15 +2823,18 @@ void drawFeature()
     switch (selectedApp) {
     case 0:  drawConnectScreen(); break;
     case 1:  drawConfigScreen(); break;
-    case 2:  drawClockScreen(); break; // NEON CYBERPUNK CLOCK
-    case 3:  drawSurveyList(true); break;  // BLE
-    case 4:  drawSurveyList(false); break; // WIFI
-    case 5:  drawMeshRfScreen(); break;
-    case 8:  drawMiscTelemetry(); break;
-    case 9:  drawJsDiagnosticRunner(); break;
-    case 10: drawIrScreen(); break;
-    case 12: drawWebRadioScreen(); break;  // WEBRADIO (PH DEFAULT)
-    case 13: drawFileBrowser(); break;
+    case 2:  drawClockScreen(); break;       // NEON CYBERPUNK CLOCK
+    case 3:  drawSurveyList(true); break;    // BLE SCANNER & BEACONS
+    case 4:  drawSurveyList(false); break;   // WIFI SURVEY & CHANNELS
+    case 5:  drawSubGhzRfScreen(); break;    // SUB-1GHz CC1101 & MESHTATIC LORA
+    case 6:  drawNrfSpectrumScreen(); break; // NRF24 / 2.4GHz RF SPECTRUM
+    case 7:  drawNfcRfidScreen(); break;     // 125kHz RFID & 13.56MHz NFC SUITE
+    case 8:  drawMiscTelemetry(); break;     // SYSTEM TELEMETRY
+    case 9:  drawJsDiagnosticRunner(); break;// JS MACRO DIAGNOSTICS
+    case 10: drawIrApplianceScreen(); break; // IR APPLIANCES & RECEIVER LEARNER
+    case 11: drawGpsTelemetryScreen(); break;// GPS SATELLITES & NAVIGATION
+    case 12: drawWebRadioScreen(); break;    // WEBRADIO (PH DEFAULT + CUSTOM PLAYLIST)
+    case 13: drawFileBrowser(); break;       // STORAGE: MicroSD CARD & SPIFFS
     default: drawPeripheralBusScreen(); break;
     }
 }
@@ -2068,6 +2847,10 @@ void redrawScreen()
         drawHome();
     } else if (currentScreen == Screen::WifiPasswordEntry) {
         drawWifiPasswordScreen();
+    } else if (currentScreen == Screen::FilePreview) {
+        drawFilePreviewScreen();
+    } else if (currentScreen == Screen::CardIdEntry) {
+        drawCardIdEntryScreen();
     } else {
         drawFeature();
     }
@@ -2092,8 +2875,65 @@ void openSelectedApp()
 
 void handleKey(uint8_t key)
 {
-    if (keyBeepEnabled) {
+    // Avoid audio collision: do not beep speaker if radio is actively streaming
+    if (keyBeepEnabled && !radioIsPlaying) {
         M5.Speaker.tone(1400, 20);
+    }
+
+    if (currentScreen == Screen::FilePreview) {
+        if (key == kKeyEscape || key == kKeyBackspace || key == 'q' || key == 'Q') {
+            currentScreen = Screen::Feature;
+            redrawScreen();
+            return;
+        }
+        if ((key == kKeyUp || key == 'w' || key == 'W') && previewScrollPos > 0) {
+            previewScrollPos--;
+            redrawScreen();
+            return;
+        }
+        if ((key == kKeyDown || key == 's' || key == 'S') && previewScrollPos + 5 < previewLineCount) {
+            previewScrollPos++;
+            redrawScreen();
+            return;
+        }
+        return;
+    }
+
+    if (currentScreen == Screen::CardIdEntry) {
+        if (key == kKeyEscape) {
+            currentScreen = Screen::Feature;
+            redrawScreen();
+            return;
+        }
+        if (key == kKeyBackspace) {
+            if (manualCardInput.length() > 0) {
+                manualCardInput.remove(manualCardInput.length() - 1);
+                redrawScreen();
+            }
+            return;
+        }
+        if (key == kKeySelect || key == '\n') {
+            if (manualCardInput.length() > 0) {
+                if (rfidMode == 0) {
+                    strncpy(rfidActiveUid, manualCardInput.c_str(), sizeof(rfidActiveUid) - 1);
+                    setStatusBanner("125kHz Card UID Set!");
+                } else {
+                    strncpy(nfcActiveUid, manualCardInput.c_str(), sizeof(nfcActiveUid) - 1);
+                    setStatusBanner("13.56MHz NFC UID Set!");
+                }
+            }
+            currentScreen = Screen::Feature;
+            redrawScreen();
+            return;
+        }
+        if ((key >= '0' && key <= '9') || (key >= 'a' && key <= 'f') || (key >= 'A' && key <= 'F') || key == ':') {
+            if (manualCardInput.length() < 24) {
+                manualCardInput += static_cast<char>(key);
+                redrawScreen();
+            }
+            return;
+        }
+        return;
     }
 
     if (currentScreen == Screen::WifiPasswordEntry) {
@@ -2329,20 +3169,95 @@ void handleAppKey(uint8_t key)
         return;
     }
 
-    if (selectedApp == 5) { // RF MESH & MESHTATIC
-        if (key == 't' || key == 'T') {
-            sendMeshtasticBeacon(1); // Text Beacon
-            redrawScreen();
-        } else if (key == 'n' || key == 'N') {
-            sendMeshtasticBeacon(4); // NodeInfo
+    if (selectedApp == 5) { // SUB-1GHz CC1101 & MESHTATIC LORA
+        if (key == '\t') {
+            subGhzViewLora = !subGhzViewLora;
+            setStatusBanner(subGhzViewLora ? "Switched to LoRa Mesh Mode" : "Switched to CC1101 Analyzer");
             redrawScreen();
         } else if (key == 'f' || key == 'F') {
-            meshFreqIndex = (meshFreqIndex + 1) % 4;
-            saveSettings();
+            if (subGhzViewLora) {
+                meshFreqIndex = (meshFreqIndex + 1) % 4;
+                saveSettings();
+            } else {
+                subGhzFreqIndex = (subGhzFreqIndex + 1) % 4;
+                setStatusBanner(String("Freq: ") + kSubGhzFreqs[subGhzFreqIndex]);
+            }
+            redrawScreen();
+        } else if (key == 'm' || key == 'M') {
+            subGhzModIndex = (subGhzModIndex + 1) % 5;
+            setStatusBanner(String("Mod: ") + kSubGhzMods[subGhzModIndex]);
+            redrawScreen();
+        } else if (key == 'p' || key == 'P') {
+            subGhzPresetIndex = (subGhzPresetIndex + 1) % 5;
+            setStatusBanner(String("Preset: ") + kSubGhzPresets[subGhzPresetIndex]);
+            redrawScreen();
+        } else if (key == 't' || key == 'T') {
+            if (subGhzViewLora) {
+                sendMeshtasticBeacon(1);
+            } else {
+                subGhzPacketCount++;
+                setStatusBanner("RF Signal Burst Sent!");
+            }
+            redrawScreen();
+        } else if (key == 's' || key == 'S') {
+            subGhzScanning = !subGhzScanning;
+            setStatusBanner(subGhzScanning ? "RF Sniffer: SCANNING" : "RF Sniffer: PAUSED");
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 6) { // NRF24 / 2.4GHz RF SPECTRUM
+        if (key == 's' || key == 'S') {
+            nrfSweepActive = !nrfSweepActive;
+            setStatusBanner(nrfSweepActive ? "2.4GHz Sweep: ACTIVE" : "2.4GHz Sweep: PAUSED");
             redrawScreen();
         } else if (key == 'r' || key == 'R') {
-            loraHardwareDetected = probeLoraHardware();
-            setStatusBanner("Mesh bus rescanned!");
+            for (uint8_t i = 0; i < 14; ++i) nrfPeakHold[i] = 0;
+            setStatusBanner("Peak Hold Reset");
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 7) { // 125kHz RFID & 13.56MHz NFC
+        if (key == '\t') {
+            rfidMode = (rfidMode == 0) ? 1 : 0;
+            setStatusBanner(rfidMode == 0 ? "Mode: 125kHz LF RFID" : "Mode: 13.56MHz HF NFC");
+            redrawScreen();
+        } else if (key == '1') {
+            rfidMode = 0;
+            setStatusBanner("Mode: 125kHz LF RFID");
+            redrawScreen();
+        } else if (key == '2') {
+            rfidMode = 1;
+            setStatusBanner("Mode: 13.56MHz HF NFC");
+            redrawScreen();
+        } else if (key == 'r' || key == 'R') {
+            setStatusBanner("Probing RFID/NFC Bus (0x24/0x28)...");
+            redrawScreen();
+        } else if (key == 'e' || key == 'E') {
+            rfidEmulating = !rfidEmulating;
+            setStatusBanner(rfidEmulating ? "Tag Emulation: ACTIVE" : "Tag Emulation: OFF");
+            redrawScreen();
+        } else if (key == 'm' || key == 'M') {
+            manualCardInput = (rfidMode == 0) ? String(rfidActiveUid) : String(nfcActiveUid);
+            currentScreen = Screen::CardIdEntry;
+            redrawScreen();
+        } else if (key == 's' || key == 'S') {
+            if (sdCardMounted) {
+                String p = (rfidMode == 0) ? "/rfid_card.txt" : "/nfc_tag.txt";
+                File out = SD.open(p.c_str(), FILE_WRITE);
+                if (out) {
+                    out.printf("TYPE: %s\nUID: %s\n", rfidMode == 0 ? "125kHz" : "13.56MHz", rfidMode == 0 ? rfidActiveUid : nfcActiveUid);
+                    out.close();
+                    setStatusBanner(String("Saved to SD: ") + p);
+                } else {
+                    setStatusBanner("SD Write Error!");
+                }
+            } else {
+                setStatusBanner("MicroSD Not Mounted!");
+            }
             redrawScreen();
         }
         return;
@@ -2362,30 +3277,87 @@ void handleAppKey(uint8_t key)
         return;
     }
 
-    if (selectedApp == 10) { // IR TX
-        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedIrIndex > 0) {
-            selectedIrIndex--;
+    if (selectedApp == 10) { // IR APPLIANCE REMOTE & LEARNER
+        if (key >= '1' && key <= '4') {
+            irCategory = key - '1';
+            irSelectedCmd = 0;
             redrawScreen();
-        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedIrIndex < 7) {
-            selectedIrIndex++;
+            return;
+        }
+        if (key == kKeyUp || key == 'w' || key == 'W') {
+            if (irSelectedCmd > 0) irSelectedCmd--;
+            redrawScreen();
+        } else if (key == kKeyDown || key == 's' || key == 'S') {
+            if (irSelectedCmd < 5) irSelectedCmd++;
             redrawScreen();
         } else if (key == kKeySelect || key == '\n' || key == ' ') {
-            transmitIrCode(selectedIrIndex);
+            transmitIrCode(irSelectedCmd);
+            redrawScreen();
+        } else if (key == 's' || key == 'S') {
+            if (sdCardMounted) {
+                File out = SD.open("/ir_learned.txt", FILE_WRITE);
+                if (out) {
+                    out.printf("PROTOCOL: %s\nHEX: 0x%08lX\n", irLearnedProtocol, static_cast<unsigned long>(irLearnedCode));
+                    out.close();
+                    setStatusBanner("IR Code Saved to SD!");
+                }
+            }
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 11) { // GPS SATELLITES & NAVIGATION
+        if (key == 'u' || key == 'U') {
+            gpsFormatDms = !gpsFormatDms;
+            setStatusBanner(gpsFormatDms ? "Coords: DMS Format" : "Coords: Decimal Degrees");
+            redrawScreen();
+        } else if (key == 's' || key == 'S') {
+            if (sdCardMounted) {
+                File out = SD.open("/gps_waypoints.txt", FILE_APPEND);
+                if (out) {
+                    out.printf("LAT: %.6f, LON: %.6f, ALT: %.1f\n", gpsLat, gpsLon, gpsAlt);
+                    out.close();
+                    setStatusBanner("Waypoint Saved to SD!");
+                }
+            }
             redrawScreen();
         }
         return;
     }
 
     if (selectedApp == 12) { // WEBRADIO
+        if (radioStationListOpen) {
+            if (key == kKeyUp || key == 'w' || key == 'W') {
+                if (radioStationListCursor > 0) radioStationListCursor--;
+                redrawScreen();
+                return;
+            } else if (key == kKeyDown || key == 's' || key == 'S') {
+                if (radioStationListCursor + 1 < gRadioStationCount) radioStationListCursor++;
+                redrawScreen();
+                return;
+            } else if (key == kKeySelect || key == '\n' || key == ' ') {
+                radioStationListOpen = false;
+                startWebRadio(radioStationListCursor);
+                redrawScreen();
+                return;
+            } else if (key == kKeyEscape || key == 'l' || key == 'L') {
+                radioStationListOpen = false;
+                redrawScreen();
+                return;
+            }
+            return;
+        }
+
         if (key == ' ' || key == kKeySelect || key == '\n') {
             toggleWebRadio();
             redrawScreen();
         } else if (key == 'a' || key == 'A' || key == kKeyLeft) {
-            size_t nextSt = (currentRadioStation + kRadioStationCount - 1) % kRadioStationCount;
+            size_t nextSt = (currentRadioStation + gRadioStationCount - 1) % gRadioStationCount;
             startWebRadio(nextSt);
             redrawScreen();
         } else if (key == 'd' || key == 'D' || key == kKeyRight) {
-            size_t nextSt = (currentRadioStation + 1) % kRadioStationCount;
+            size_t nextSt = (currentRadioStation + 1) % gRadioStationCount;
             startWebRadio(nextSt);
             redrawScreen();
         } else if (key == 'w' || key == 'W' || key == kKeyUp) {
@@ -2402,6 +3374,10 @@ void handleAppKey(uint8_t key)
             radioIsMuted = !radioIsMuted;
             if (gAudioPlayer) gAudioPlayer->setVolume(radioIsMuted ? 0 : radioVolume);
             redrawScreen();
+        } else if (key == 'l' || key == 'L') {
+            radioStationListOpen = !radioStationListOpen;
+            radioStationListCursor = currentRadioStation;
+            redrawScreen();
         } else if (key == 'r' || key == 'R') {
             startWebRadio(currentRadioStation);
             redrawScreen();
@@ -2416,6 +3392,20 @@ void handleAppKey(uint8_t key)
         } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedFile + 1 < fileEntryCount) {
             selectedFile++;
             redrawScreen();
+        } else if (key == kKeySelect || key == '\n' || key == ' ') {
+            openSelectedFile();
+        } else if (key == '[' || key == kKeyBackspace) {
+            if (currentDirectory != "/") {
+                int lastSlash = currentDirectory.lastIndexOf('/');
+                if (lastSlash > 0) {
+                    currentDirectory = currentDirectory.substring(0, lastSlash);
+                } else {
+                    currentDirectory = "/";
+                }
+                selectedFile = 0;
+                loadFileList();
+                redrawScreen();
+            }
         } else if (key == '\t' || key == 't' || key == 'T') {
             useSdCard = !useSdCard;
             loadFileList();
@@ -2679,6 +3669,7 @@ void setup()
 
     ensureFilesystemReady();
     initSdCard(); // Auto-detect and mount MicroSD Card on Cardputer!
+    loadRadioPlaylist(); // Load custom stations from MicroSD / SPIFFS or fallback defaults
     initializeKeyboard();
     initMeshRadio();
 
