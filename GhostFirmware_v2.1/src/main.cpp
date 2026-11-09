@@ -151,33 +151,31 @@ constexpr uint8_t kLoraBusyPin = 6;
 constexpr std::array<uint8_t, 3> kMatrixOutputPins = {8, 9, 11};
 constexpr std::array<uint8_t, 7> kMatrixInputPins = {13, 15, 3, 4, 5, 6, 7};
 
-// Keyboard lookup tables for 74HC138 matrix
-constexpr uint8_t kKeyMapNormal[kTotalKeys] = {
-    '`', '1', '2', '3', '4', '5', '6', '7',
-    '8', '9', '0', '-', '=', kKeyBackspace, 0, '\t',
-    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',
-    'o', 'p', '[', ']', '\\', 0, 0, 'a',
-    's', 'd', 'f', 'g', 'h', 'j', 'k', 'l',
-    ';', '\'', kKeySelect, 0, 0, 'z', 'x', 'c',
-    'v', 'b', 'n', 'm', ',', '.', '/', ' '};
+// Cardputer Physical 4x14 Keyboard Matrix Lookup Tables
+// Row 0: ` 1 2 3 4 5 6 7 8 9 0 - = Del
+// Row 1: Tab q w e r t y u i o p [ ] \
+// Row 2: Fn Shift a s d f g h j k l ; ' Enter
+// Row 3: Ctrl Opt Alt z x c v b n m , . / Space
+constexpr uint8_t kKeyMapNormal4x14[4][14] = {
+    {'`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', kKeyBackspace},
+    {'\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\\'},
+    {0, 0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', kKeySelect},
+    {0, 0, 0, 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', ' '}
+};
 
-constexpr uint8_t kKeyMapShift[kTotalKeys] = {
-    '~', '!', '@', '#', '$', '%', '^', '&',
-    '*', '(', ')', '_', '+', kKeyBackspace, 0, '\t',
-    'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I',
-    'O', 'P', '{', '}', '|', 0, 0, 'A',
-    'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L',
-    ':', '"', kKeySelect, 0, 0, 'Z', 'X', 'C',
-    'V', 'B', 'N', 'M', '<', '>', '?', ' '};
+constexpr uint8_t kKeyMapShift4x14[4][14] = {
+    {'~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', kKeyBackspace},
+    {'\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '|'},
+    {0, 0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', kKeySelect},
+    {0, 0, 0, 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', ' '}
+};
 
-constexpr uint8_t kKeyMapFunction[kTotalKeys] = {
-    kKeyEscape, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, '_', '+', kKeyBackspace, 0, '\t',
-    0, kKeyUp, 0, 0, 0, 0, 0, 0,
-    0, 0, '{', '}', '|', 0, 0, kKeyLeft,
-    kKeyDown, kKeyRight, 0, 0, 0, 0, 0, 0,
-    ':', '"', kKeySelect, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, '<', '>', '?', ' '};
+constexpr uint8_t kKeyMapFn4x14[4][14] = {
+    {kKeyEscape, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '_', '+', kKeyBackspace},
+    {'\t', 0, kKeyUp, 0, 0, 0, 0, 0, 0, 0, 0, '{', '}', '|'},
+    {0, 0, kKeyLeft, kKeyDown, kKeyRight, 0, 0, 0, 0, 0, 0, kKeyUp, '"', kKeySelect},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, kKeyLeft, kKeyDown, kKeyRight, ' '}
+};
 
 enum class Screen : uint8_t {
     Home = 0,
@@ -465,19 +463,38 @@ const NeonClockTheme &activeClockTheme()
 
 void enforceLandscapeOrientation()
 {
-    // On Cardputer ST7789 display:
+    // On Cardputer ST7789 display (1.14" 240x135 px):
+    // Physical panel glass is 135x240 with offset_x=52, offset_y=40.
+    // Ensure the ST7789 panel parameters match Cardputer hardware exactly:
+    auto p = M5.Display.panel();
+    if (p) {
+        auto cfg = p->config();
+        if (cfg.panel_width != 135 || cfg.panel_height != 240 || cfg.offset_x != 52 || cfg.offset_y != 40) {
+            cfg.panel_width = 135;
+            cfg.panel_height = 240;
+            cfg.offset_x = 52;
+            cfg.offset_y = 40;
+            cfg.offset_rotation = 0;
+            p->config(cfg);
+        }
+    }
+
     // Rotation 1: Standard Horizontal Landscape (240x135)
     // Rotation 3: Inverted Horizontal Landscape (240x135)
-    // Rotation 0 and 2 are Portrait (135x240) - Prohibited on Cardputer!
     if (screenRotation != 1 && screenRotation != 3) {
         screenRotation = 1;
     }
     M5.Display.setRotation(screenRotation);
 
-    // If panel reporting height > width, rotate 90 degrees to ensure landscape orientation
+    // If screen reports height > width (portrait), find the landscape rotation:
     if (M5.Display.width() < M5.Display.height()) {
-        screenRotation = (screenRotation == 1) ? 3 : 1;
-        M5.Display.setRotation(screenRotation);
+        for (uint8_t r = 0; r < 4; ++r) {
+            M5.Display.setRotation(r);
+            if (M5.Display.width() > M5.Display.height()) {
+                screenRotation = r;
+                break;
+            }
+        }
     }
 
     screenWidth = M5.Display.width();
@@ -907,73 +924,149 @@ void initializeGpioMatrixKeyboard()
 
 bool initializeKeyboard()
 {
-    // 1. Probe for Cardputer-Adv TCA8418 I2C keyboard controller at 0x34
+    // Initialize casing button (GPIO 0)
+    pinMode(0, INPUT_PULLUP);
+
+    // 1. Clear I2C bus on GPIO 8 (SDA) and GPIO 9 (SCL)
+    pinMode(8, INPUT_PULLUP);
+    pinMode(9, OUTPUT);
+    for (int i = 0; i < 9; ++i) {
+        digitalWrite(9, LOW);
+        delayMicroseconds(5);
+        digitalWrite(9, HIGH);
+        delayMicroseconds(5);
+    }
+
+    // 2. Probe for Cardputer-Adv TCA8418 I2C keyboard controller at 0x34
     Wire.begin(8, 9, 100000);
-    Wire.setTimeOut(40);
+    Wire.setTimeOut(50);
     Wire.beginTransmission(kKeyboardAddressTca);
     if (Wire.endTransmission() == 0) {
         keyboardAddress = kKeyboardAddressTca;
-        constexpr uint8_t resetRegisters[][2] = {
-            {0x23, 0x00}, {0x24, 0x00}, {0x25, 0x00}, {0x20, 0xFF}, {0x21, 0xFF}, {0x22, 0xFF},
-            {0x26, 0x00}, {0x27, 0x00}, {0x28, 0x00}, {0x1A, 0xFF}, {0x1B, 0xFF}, {0x1C, 0xFF},
-            {0x1D, 0x7F}, {0x1E, 0xFF}, {0x29, 0x00}, {0x2A, 0x00}, {0x2B, 0x00}, {0x02, 0x03}};
-        bool ok = true;
-        for (const auto &entry : resetRegisters) {
-            if (!writeKeyboardRegister(entry[0], entry[1])) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
-            while (readKeyboardRegister(kKeyEventCountRegister) > 0) {
-                (void)readKeyboardRegister(kKeyEventRegister);
-            }
-            keyboardDriver = KeyboardDriver::Tca8418I2c;
-            return true;
-        }
-    }
-    Wire.end();
+        keyboardDriver = KeyboardDriver::Tca8418I2c;
 
-    // 2. Standard Cardputer v1.0 / v1.1 74HC138 GPIO demux matrix
+        // Reset & setup registers following official M5Stack Cardputer ADV standard:
+        // Set all GPIO to INPUT
+        writeKeyboardRegister(0x23, 0x00); // GPIO_DIR_1
+        writeKeyboardRegister(0x24, 0x00); // GPIO_DIR_2
+        writeKeyboardRegister(0x25, 0x00); // GPIO_DIR_3
+
+        // Enable GPI event mode for all pins
+        writeKeyboardRegister(0x20, 0xFF); // GPI_EM_1
+        writeKeyboardRegister(0x21, 0xFF); // GPI_EM_2
+        writeKeyboardRegister(0x22, 0xFF); // GPI_EM_3
+
+        // Set GPIO interrupt level to falling
+        writeKeyboardRegister(0x26, 0x00); // GPIO_INT_LVL_1
+        writeKeyboardRegister(0x27, 0x00); // GPIO_INT_LVL_2
+        writeKeyboardRegister(0x28, 0x00); // GPIO_INT_LVL_3
+
+        // Enable GPIO interrupts
+        writeKeyboardRegister(0x1A, 0xFF); // GPIO_INT_EN_1
+        writeKeyboardRegister(0x1B, 0xFF); // GPIO_INT_EN_2
+        writeKeyboardRegister(0x1C, 0xFF); // GPIO_INT_EN_3
+
+        // KP_GPIO_1 (0x1D): Enable ROW0..ROW6 (7 rows)
+        writeKeyboardRegister(0x1D, 0x7F);
+        // KP_GPIO_2 (0x1E): Enable COL0..COL7 (8 columns)
+        writeKeyboardRegister(0x1E, 0xFF);
+        // KP_GPIO_3 (0x1F): Disable COL8..COL9
+        writeKeyboardRegister(0x1F, 0x00);
+
+        // Debounce enables (0x29..0x2B)
+        writeKeyboardRegister(0x29, 0x00);
+        writeKeyboardRegister(0x2A, 0x00);
+        writeKeyboardRegister(0x2B, 0x00);
+
+        // Flush FIFO
+        for (uint8_t f = 0; f < 16; ++f) {
+            if (readKeyboardRegister(kKeyEventRegister) == 0) break;
+            delay(1);
+        }
+
+        // Clear interrupt status flags (0x02)
+        writeKeyboardRegister(0x02, 0x03);
+
+        // CFG register (0x01): enable GPI_IEN (bit 1) and KE_IEN (bit 0)
+        // Keep AI (bit 7) = 0 so reading kKeyEventRegister (0x04) repeatedly pops FIFO correctly
+        writeKeyboardRegister(0x01, 0x03);
+
+        pinMode(11, INPUT_PULLUP); // KB_INT interrupt line
+        return true;
+    }
+
+    // 2. Standard Cardputer v1.0 / v1.1 74HC138 GPIO demux matrix fallback
+    Wire.end();
     initializeGpioMatrixKeyboard();
     return true;
 }
 
-uint8_t translateKeyIndex(uint8_t keyIndex, uint8_t activeMods)
+uint8_t translateKey4x14(uint8_t phys_row, uint8_t phys_col, uint8_t activeMods)
 {
-    if (keyIndex >= kTotalKeys) return 0;
-    if (activeMods & 0x02) return kKeyMapFunction[keyIndex];
-    if (activeMods & 0x01) return kKeyMapShift[keyIndex];
-    return kKeyMapNormal[keyIndex];
+    if (phys_row >= 4 || phys_col >= 14) return 0;
+    if (activeMods & 0x02) {
+        uint8_t k = kKeyMapFn4x14[phys_row][phys_col];
+        if (k != 0) return k;
+    }
+    if (activeMods & 0x01) {
+        uint8_t k = kKeyMapShift4x14[phys_row][phys_col];
+        if (k != 0) return k;
+    }
+    return kKeyMapNormal4x14[phys_row][phys_col];
 }
 
 void pollKeyboard()
 {
+    // Casing hardware button (GPIO 0) check:
+    static bool lastG0 = HIGH;
+    bool currG0 = digitalRead(0);
+    if (currG0 == LOW && lastG0 == HIGH) {
+        handleKey(kKeySelect); // Side casing button triggers Select/Enter
+    }
+    lastG0 = currG0;
+
+    // 1. Cardputer-Adv TCA8418 I2C keyboard
     if (keyboardDriver == KeyboardDriver::Tca8418I2c) {
-        uint8_t keyCount = readKeyboardRegister(kKeyEventCountRegister) & 0x0F;
-        if (keyCount > kMaxKeysPerRead) keyCount = kMaxKeysPerRead;
-        for (uint8_t i = 0; i < keyCount; ++i) {
+        for (uint8_t iter = 0; iter < kMaxKeysPerRead; ++iter) {
             const uint8_t event = readKeyboardRegister(kKeyEventRegister);
+            if (event == 0) break;
             const bool pressed = (event & 0x80) != 0;
-            const uint8_t code = (event & 0x7F) - 1;
-            if (code >= kTotalKeys) continue;
-            if (code == kKeyShift) {
-                if (pressed) heldModifiers |= 0x01; else heldModifiers &= ~0x01;
-                continue;
-            }
-            if (code == kKeyFunction) {
-                if (pressed) heldModifiers |= 0x02; else heldModifiers &= ~0x02;
-                continue;
-            }
-            if (pressed) {
-                const uint8_t translated = translateKeyIndex(code, heldModifiers | stickyModifiers);
-                stickyModifiers = 0;
-                if (translated != 0) handleKey(translated);
+            const uint8_t raw = (event & 0x7F);
+            if (raw == 0) continue;
+            const uint8_t k = raw - 1;
+            const uint8_t raw_row = k / 10;
+            const uint8_t raw_col = k % 10;
+            if (raw_row < 7 && raw_col < 8) {
+                const uint8_t phys_row = raw_col % 4;
+                const uint8_t phys_col = raw_row * 2 + (raw_col > 3 ? 1 : 0);
+                if (phys_row < 4 && phys_col < 14) {
+                    // Check modifiers
+                    if (phys_row == 2 && phys_col == 0) { // Fn
+                        if (pressed) heldModifiers |= 0x02; else heldModifiers &= ~0x02;
+                        continue;
+                    }
+                    if (phys_row == 2 && phys_col == 1) { // Shift
+                        if (pressed) heldModifiers |= 0x01; else heldModifiers &= ~0x01;
+                        continue;
+                    }
+                    if (phys_row == 3 && phys_col < 3) { // Ctrl, Opt, Alt
+                        continue;
+                    }
+                    if (pressed) {
+                        const uint8_t translated = translateKey4x14(phys_row, phys_col, heldModifiers | stickyModifiers);
+                        stickyModifiers = 0;
+                        if (translated != 0) {
+                            handleKey(translated);
+                        }
+                    }
+                }
             }
         }
+        writeKeyboardRegister(0x02, 0x03); // Clear both K_INT and GPI_INT flags
         return;
     }
 
+    // 2. Standard Cardputer v1.0 / v1.1 74HC138 GPIO demux matrix
     if (keyboardDriver == KeyboardDriver::GpioMatrix74HC138) {
         for (uint8_t col = 0; col < kKeyboardColumns; ++col) {
             setMatrixOutput(col);
@@ -982,18 +1075,29 @@ void pollKeyboard()
                 const uint8_t keyIndex = static_cast<uint8_t>(row * kKeyboardColumns + col);
                 if (keyIndex >= kTotalKeys) continue;
                 const bool pressed = (digitalRead(kMatrixInputPins[row]) == LOW);
-                if (pressed && !previousKeyStates[keyIndex]) {
-                    if (keyIndex == kKeyShift) {
-                        stickyModifiers ^= 0x01;
-                    } else if (keyIndex == kKeyFunction) {
-                        stickyModifiers ^= 0x02;
-                    } else {
-                        const uint8_t translated = translateKeyIndex(keyIndex, heldModifiers | stickyModifiers);
-                        stickyModifiers = 0;
-                        if (translated != 0) handleKey(translated);
+                if (pressed != previousKeyStates[keyIndex]) {
+                    previousKeyStates[keyIndex] = pressed;
+                    const uint8_t phys_row = col % 4;
+                    const uint8_t phys_col = row * 2 + (col >= 4 ? 1 : 0);
+                    if (phys_row < 4 && phys_col < 14) {
+                        if (phys_row == 2 && phys_col == 0) { // Fn
+                            if (pressed) heldModifiers |= 0x02; else heldModifiers &= ~0x02;
+                            continue;
+                        }
+                        if (phys_row == 2 && phys_col == 1) { // Shift
+                            if (pressed) heldModifiers |= 0x01; else heldModifiers &= ~0x01;
+                            continue;
+                        }
+                        if (phys_row == 3 && phys_col < 3) continue;
+                        if (pressed) {
+                            const uint8_t translated = translateKey4x14(phys_row, phys_col, heldModifiers | stickyModifiers);
+                            stickyModifiers = 0;
+                            if (translated != 0) {
+                                handleKey(translated);
+                            }
+                        }
                     }
                 }
-                previousKeyStates[keyIndex] = pressed;
             }
         }
     }
@@ -1816,7 +1920,15 @@ void handleKey(uint8_t key)
     }
 
     if (currentScreen == Screen::Home) {
-        if (key == kKeyLeft || key == 'a' || key == 'A') {
+        if (key >= '1' && key <= '9') {
+            selectedApp = static_cast<uint8_t>((key - '1') % kThemeCount);
+            openSelectedApp();
+            return;
+        } else if (key == '0') {
+            selectedApp = 9;
+            openSelectedApp();
+            return;
+        } else if (key == kKeyLeft || key == 'a' || key == 'A') {
             selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
             redrawScreen();
         } else if (key == kKeyRight || key == 'd' || key == 'D') {
@@ -1834,7 +1946,7 @@ void handleKey(uint8_t key)
         return;
     }
 
-    if (key == kKeyEscape) {
+    if (key == kKeyEscape || key == kKeyBackspace || key == '`') {
         if (selectedApp == 2 && clockSettingsOpen) {
             clockSettingsOpen = false;
             redrawScreen();
@@ -2127,6 +2239,7 @@ void setup()
     auto config = M5.config();
     config.serial_baudrate = 115200;
     config.clear_display = true;
+    config.fallback_board = m5::board_t::board_M5Cardputer;
     M5.begin(config);
 
     // CRITICAL: Strictly lock screen orientation to Landscape (240x135) for Cardputer!

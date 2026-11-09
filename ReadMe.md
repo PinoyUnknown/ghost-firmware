@@ -331,8 +331,8 @@ python -m esptool --chip esp32s3 -p COM5 -b 1500000 write_flash \
 
 | File | Size | SHA-256 Checksum |
 | :--- | :--- | :--- |
-| **`Ghost-Firmware-v2.1.bin`** | 2,045,728 bytes | `E4BC550E6196BB0AE08DBC725B7D31615D0015F7FB853B52032837D3F3242B7C` |
-| **`GhostFirmware_Cardputer.bin`** | 2,045,728 bytes | `E4BC550E6196BB0AE08DBC725B7D31615D0015F7FB853B52032837D3F3242B7C` |
+| **`Ghost-Firmware-v2.1.bin`** | 2,046,896 bytes | `A6F67B6C9DA2E2787DF03EBDD21382CA3538BCBC29C3FCE58EF5EA4072ABEA2E` |
+| **`GhostFirmware_Cardputer.bin`** | 2,046,896 bytes | `A6F67B6C9DA2E2787DF03EBDD21382CA3538BCBC29C3FCE58EF5EA4072ABEA2E` |
 
 *Both files are identical single-file flasher binaries ready for offset `0x0`.*
 
@@ -341,9 +341,16 @@ python -m esptool --chip esp32s3 -p COM5 -b 1500000 write_flash \
 ## 📜 Comprehensive Changelog (Version History)
 
 ### 🚀 Version 2.1 (Current Release) — November 2026
-* **Fixed Display Orientation:**
-  - Implemented `enforceLandscapeOrientation()` locking ST7789 rotation strictly to horizontal landscape mode ($240 \times 135$).
-  - Added runtime NVS preference sanitization to prevent accidental portrait rotation.
+* **Fixed Display Orientation & ST7789 Panel Offset:**
+  - Enforced ST7789V2 panel geometry parameters (`panel_width = 135`, `panel_height = 240`, `offset_x = 52`, `offset_y = 40`) to fix display clipping and shift.
+  - Added compile-time flag `-D M5GFX_BOARD=m5gfx::board_t::board_M5Cardputer` to prevent M5GFX from misidentifying Cardputer-Adv as M5VAMeter.
+  - Implemented `enforceLandscapeOrientation()` locking ST7789 rotation strictly to horizontal landscape mode ($240 \times 135$) with NVS sanitization.
+* **TCA8418 I2C & 74HC138 Dual Keyboard Driver:**
+  - Added dedicated Texas Instruments **TCA8418 I2C controller driver** at address `0x34` (SDA=GPIO 8, SCL=GPIO 9, INT=GPIO 11) for Cardputer-Adv and Cardputer Mesh Kit.
+  - Configured full register initialization (`0x1D=0x7F`, `0x1E=0xFF`, `0x01=0x03`), interrupt clear (`0x02=0x03`), and real-time FIFO event polling.
+  - Implemented exact Cardputer physical 4x14 keyboard coordinate mapping with Shift and Fn modifier support (Esc, Enter, Backspace, Arrows, Tab, Symbols).
+  - Maintained complete backward compatibility with classic Cardputer v1.0 / v1.1 via 74HC138 GPIO demux matrix driver.
+  - Added hardware casing button `G0` (GPIO 0) as physical Select/Enter button.
 * **Edge-to-Edge HUD Layout Scaling:**
   - Scaled all 14 Cyberpunk HUD illustrations ($320 \times 144$) to $240 \times 108$ at $0.75\times$ scale ($y=14..121$).
   - Header ($y=0..13$) and footer ($y=122..134$) are preserved with zero clipping and zero visual distortion.
