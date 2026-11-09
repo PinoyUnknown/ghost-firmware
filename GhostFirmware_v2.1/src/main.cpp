@@ -2435,26 +2435,31 @@ void handleAppKey(uint8_t key)
 void showBootSplash()
 {
     const ColorPalette &pal = activePalette();
-    constexpr uint16_t totalBootMs = 10000;
-    constexpr uint16_t frameIntervalMs = 80;
-    constexpr uint16_t totalFrames = totalBootMs / frameIntervalMs; // 125 frames (~10.0 seconds)
+    const int16_t centerX = screenWidth / 2;
+    bool skipAll = false;
 
-    for (uint16_t frame = 0; frame < totalFrames; ++frame) {
-        const float progress = static_cast<float>(frame) / (totalFrames - 1);
-        const int16_t centerX = screenWidth / 2;
+    // =========================================================================
+    // PHASE 1: GHOST FLASHING BOOT SCREEN ANIMATION (13.5 Seconds)
+    // =========================================================================
+    constexpr uint16_t totalGhostMs = 13500; // >= 13 seconds
+    constexpr uint16_t ghostIntervalMs = 75;
+    constexpr uint16_t ghostFrames = totalGhostMs / ghostIntervalMs; // 180 frames (~13.5s)
+
+    for (uint16_t frame = 0; frame < ghostFrames; ++frame) {
+        const float progress = static_cast<float>(frame) / (ghostFrames - 1);
 
         canvas.fillScreen(pal.background);
 
-        // Cyberpunk outer frame
+        // Cyberpunk outer neon borders
         canvas.drawRect(2, 2, screenWidth - 4, screenHeight - 4, pal.accent);
         canvas.drawRect(4, 4, screenWidth - 8, screenHeight - 8, pal.primary);
 
         // Holographic expanding sonar rings around Ghost icon
-        int16_t ringR = (frame * 3) % 38;
+        int16_t ringR = (frame * 3) % 40;
         canvas.drawCircle(centerX, 23, ringR, pal.accent);
 
         // Pulsing Cyber Ghost Icon (Center Top)
-        const float pulse = 1.0F + 0.10F * std::sin(progress * 8.0F * 3.14159F);
+        const float pulse = 1.0F + 0.12F * std::sin(progress * 10.0F * 3.14159F);
         const int16_t size = static_cast<int16_t>(22.0F * pulse);
         const int16_t top = 23 - size / 2;
         const int16_t left = centerX - size / 2;
@@ -2462,13 +2467,13 @@ void showBootSplash()
 
         canvas.fillCircle(centerX, top + size / 3, size / 3, pal.primary);
         canvas.fillRect(left + size / 6, top + size / 3, size * 2 / 3, bodyH / 2, pal.primary);
-        // Neon glowing cyan eyes
+        // Neon glowing cyan eyes with white pupils
         canvas.fillCircle(centerX - size / 5, top + size / 3, 2, pal.accent);
         canvas.fillCircle(centerX + size / 5, top + size / 3, 2, pal.accent);
         canvas.fillCircle(centerX - size / 5, top + size / 3, 1, 0xFFFF);
         canvas.fillCircle(centerX + size / 5, top + size / 3, 1, 0xFFFF);
 
-        // Diagnostic hardware boot step lines
+        // Hardware Diagnostic lines
         const char *diagMsg = "BOOT [01/07]: ESP32-S3FN8 240MHz ... OK";
         if (progress > 0.85f)      diagMsg = "BOOT [07/07]: 56-KEY MATRIX READY ... OK";
         else if (progress > 0.70f) diagMsg = "BOOT [06/07]: MicroSD & SPIFFS MOUNTED ... OK";
@@ -2502,18 +2507,153 @@ void showBootSplash()
         canvas.drawString("DEVELOPER: PinoyUnknown (@pinoyunknown)", centerX, 88);
 
         canvas.setTextColor(0x07E0, pal.background);
-        canvas.drawString("github.com/PinoyUnknown/ghost-firmware", centerX, 100);
+        canvas.drawString("https://github.com/PinoyUnknown/ghost-firmware", centerX, 100);
 
         canvas.setTextColor(pal.primary, pal.background);
-        canvas.drawString("[PRESS ANY KEY OR G0 TO SKIP BOOT]", centerX, 114);
+        canvas.drawString("[PRESS G0 / ANY KEY TO SKIP]", centerX, 114);
 
         canvas.pushSprite(0, 0);
 
-        // Allow immediate skip if casing button (G0) is pressed
+        if (digitalRead(0) == LOW) {
+            skipAll = true;
+            break;
+        }
+        delay(ghostIntervalMs);
+    }
+
+    if (skipAll) return;
+
+    // =========================================================================
+    // PHASE 2: "FUTURISTIC SOFTWARES" FLASHING ANIMATION (3.2 Seconds)
+    // =========================================================================
+    constexpr uint16_t totalFuturisticMs = 3200; // >= 3 seconds
+    constexpr uint16_t futIntervalMs = 80;
+    constexpr uint16_t futFrames = totalFuturisticMs / futIntervalMs; // 40 frames (~3.2s)
+
+    for (uint16_t frame = 0; frame < futFrames; ++frame) {
+        canvas.fillScreen(pal.background);
+
+        // Cyber matrix outer grid box
+        canvas.drawRect(2, 2, screenWidth - 4, screenHeight - 4, pal.primary);
+        canvas.drawRect(5, 5, screenWidth - 10, screenHeight - 10, pal.accent);
+
+        // Flashing neon scanline effect
+        int16_t scanY = (frame * 5) % (screenHeight - 12) + 6;
+        canvas.drawFastHLine(6, scanY, screenWidth - 12, 0x07E0);
+
+        // Subtle electric neon glow flicker
+        uint16_t neonMain = (frame % 4 == 0) ? 0xFFFF : pal.primary;
+        uint16_t neonSec = (frame % 6 == 0) ? 0xF81F : pal.accent;
+
+        canvas.setTextDatum(textdatum_t::middle_center);
+
+        // Upper divider: ========
+        canvas.setTextSize(2);
+        canvas.setTextColor(neonSec, pal.background);
+        canvas.drawString("========", centerX, 22);
+
+        // BIG TEXT: FUTURISTIC
+        canvas.setTextColor(0x0210);
+        canvas.drawString("FUTURISTIC", centerX - 1, 48);
+        canvas.drawString("FUTURISTIC", centerX + 1, 48);
+        canvas.drawString("FUTURISTIC", centerX, 47);
+        canvas.drawString("FUTURISTIC", centerX, 49);
+        canvas.setTextColor(neonMain, pal.background);
+        canvas.drawString("FUTURISTIC", centerX, 48);
+
+        // BIG TEXT: SOFTWARES
+        canvas.setTextColor(0x2008);
+        canvas.drawString("SOFTWARES", centerX - 1, 74);
+        canvas.drawString("SOFTWARES", centerX + 1, 74);
+        canvas.drawString("SOFTWARES", centerX, 73);
+        canvas.drawString("SOFTWARES", centerX, 75);
+        canvas.setTextColor(neonSec, pal.background);
+        canvas.drawString("SOFTWARES", centerX, 74);
+
+        // Lower divider: ========
+        canvas.setTextColor(neonSec, pal.background);
+        canvas.drawString("========", centerX, 100);
+
+        // Subtitle line
+        canvas.setTextSize(1);
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString("CYBERNETIC SYSTEMS & TACTICAL TOOLS", centerX, 120);
+
+        canvas.pushSprite(0, 0);
+
+        if (digitalRead(0) == LOW) {
+            skipAll = true;
+            break;
+        }
+        delay(futIntervalMs);
+    }
+
+    if (skipAll) return;
+
+    // =========================================================================
+    // PHASE 3: "TEAM WHITE HAT" PHILIPPINES FLASHING ANIMATION (3.2 Seconds)
+    // =========================================================================
+    constexpr uint16_t totalWhiteHatMs = 3200; // >= 3 seconds
+    constexpr uint16_t whIntervalMs = 80;
+    constexpr uint16_t whFrames = totalWhiteHatMs / whIntervalMs; // 40 frames (~3.2s)
+
+    for (uint16_t frame = 0; frame < whFrames; ++frame) {
+        canvas.fillScreen(pal.background);
+
+        // Cyber decorative corner brackets
+        canvas.drawRect(2, 2, screenWidth - 4, screenHeight - 4, 0x07E0);
+        canvas.drawRect(4, 4, screenWidth - 8, screenHeight - 8, 0xFFFF);
+
+        // Starburst / Radar pulse
+        int16_t burstR = (frame * 4) % 65;
+        canvas.drawCircle(centerX, 58, burstR, pal.accent);
+
+        uint16_t titleColor = (frame % 3 == 0) ? 0xFFFF : 0x07FF;
+        uint16_t goldColor = (frame % 5 == 0) ? 0xFFFF : 0xFFE0;
+
+        canvas.setTextDatum(textdatum_t::middle_center);
+
+        // Upper divider: =============
+        canvas.setTextSize(1);
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString("====================================", centerX, 16);
+
+        // BIG TEXT: "TEAM WHITE HAT"
+        canvas.setTextSize(2);
+        canvas.setTextColor(0x0110);
+        canvas.drawString("\"TEAM WHITE HAT\"", centerX - 1, 44);
+        canvas.drawString("\"TEAM WHITE HAT\"", centerX + 1, 44);
+        canvas.drawString("\"TEAM WHITE HAT\"", centerX, 43);
+        canvas.drawString("\"TEAM WHITE HAT\"", centerX, 45);
+        canvas.setTextColor(titleColor, pal.background);
+        canvas.drawString("\"TEAM WHITE HAT\"", centerX, 44);
+
+        // Middle divider: =============
+        canvas.setTextSize(1);
+        canvas.setTextColor(0x07E0, pal.background);
+        canvas.drawString("====================================", centerX, 70);
+
+        // BIG TEXT: PHILIPPINES
+        canvas.setTextSize(2);
+        canvas.setTextColor(0x4200);
+        canvas.drawString("PHILIPPINES", centerX - 1, 94);
+        canvas.drawString("PHILIPPINES", centerX + 1, 94);
+        canvas.drawString("PHILIPPINES", centerX, 93);
+        canvas.drawString("PHILIPPINES", centerX, 95);
+        canvas.setTextColor(goldColor, pal.background);
+        canvas.drawString("PHILIPPINES", centerX, 94);
+
+        // Bottom tagline:
+        canvas.setTextSize(1);
+        canvas.setTextColor(pal.primary, pal.background);
+        canvas.drawString("CYBER SECURITY & DEFENSIVE TACTICS", centerX, 120);
+
+        canvas.pushSprite(0, 0);
+
         if (digitalRead(0) == LOW) {
             break;
         }
-        delay(frameIntervalMs);
+        delay(whIntervalMs);
     }
 }
 

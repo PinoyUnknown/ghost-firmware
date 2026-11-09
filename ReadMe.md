@@ -336,8 +336,8 @@ python -m esptool --chip esp32s3 -p COM5 -b 1500000 write_flash \
 
 | File | Size | SHA-256 Checksum |
 | :--- | :--- | :--- |
-| **`Ghost-Firmware-v2.1.bin`** | 2,087,232 bytes | `FD75CC8ABDF8AAD7B5B4E9A5BBD91111ADB17922B0F12BBD36F2C1A60236D0B6` |
-| **`GhostFirmware_Cardputer.bin`** | 2,087,232 bytes | `FD75CC8ABDF8AAD7B5B4E9A5BBD91111ADB17922B0F12BBD36F2C1A60236D0B6` |
+| **`Ghost-Firmware-v2.1.bin`** | 2,089,328 bytes | `6C5891EB79B3B092C35F74CA6B33F7028B60EF5288E60B0850828B9C8D94AB0F` |
+| **`GhostFirmware_Cardputer.bin`** | 2,089,328 bytes | `6C5891EB79B3B092C35F74CA6B33F7028B60EF5288E60B0850828B9C8D94AB0F` |
 
 *Both files are unified single-file flasher binaries ready for offset `0x0`.*
 
@@ -346,32 +346,28 @@ python -m esptool --chip esp32s3 -p COM5 -b 1500000 write_flash \
 ## 📜 Comprehensive Changelog (Version History)
 
 ### 🚀 Version 2.1 (Current Release) — November 2026
-* **100% Zero-Flicker Double-Buffered Graphics Engine:**
-  - Migrated entire UI rendering pipeline to `M5Canvas` (`LGFX_Sprite`) off-screen frame buffer.
-  - Eliminated screen flashing/tearing caused by direct SPI `fillScreen()` operations.
-  - Atomic single-burst frame transfers (`canvas.pushSprite(0, 0)`) for smooth 60fps-like graphics.
-* **Interactive Wi-Fi Connection & Physical Keyboard Password Input:**
-  - Added dedicated cyberpunk Wi-Fi credential input modal (`Screen::WifiPasswordEntry`).
-  - Full Cardputer physical keyboard alphanumeric typing with Del/Backspace and Enter/Connect support.
-  - Dynamic connection status feedback with animated DHCP connection dots.
-  - Automatic credential persistence in NVS Preferences (`w_ssid`, `w_pass`) for seamless background auto-connect on boot.
-* **Automatic Internet Time Synchronization (NTP):**
-  - Triggers automatic NTP network synchronization (`pool.ntp.org`, `time.google.com`) as soon as Wi-Fi connects.
-  - Set to Philippine / Manila Time (UTC+8: `configTime(8 * 3600, 0, ...)`) by default.
-  - Manual on-demand NTP re-sync and manual time adjustments via Neon Clock settings modal.
-* **MicroSD TF-Card Auto-Detection & Dual Storage Manager:**
-  - Auto-probes and mounts Cardputer MicroSD TF-cards on hardware SPI (CS=12, SCK=40, MISO=39, MOSI=14) alongside internal SPIFFS flash.
-  - Handled SPI bus coexistence with Cap LoRa-1262 SX1262 (CS=5).
-  - Added `TAB` / `T` hotkey to toggle seamlessly between MicroSD and SPIFFS file systems in the `FILE` manager.
-  - Live card capacity and free space calculation in MB/KB.
-* **Cinematic 10-Second Neon Boot Animation:**
-  - 10-second cyberpunk startup sequence with pulsating neon cyber skull/ghost and expanding holographic sonar rings.
-  - Scrolling diagnostic hardware boot verification lines for CPU, SRAM, Flash, ST7789, Audio, SX1262, MicroSD, and Keyboard.
-  - Cyberpunk progress bar (0% to 100%) and prominent developer links:
+* **3-Phase Cinematic Cyberpunk Boot & Flashing Animation Sequence:**
+  - **Phase 1 (13.5 Seconds):** Flashing Ghost Cyber Animation with pulsating neon cyber skull, expanding holographic sonar rings, live hardware diagnostics verification lines, progress bar (0% -> 100%), and prominent developer link:
     - `GHOST FIRMWARE v2.1 | ADVANCED EDITION`
     - `DEVELOPER: PinoyUnknown (@pinoyunknown)`
-    - `github.com/PinoyUnknown/ghost-firmware`
-  - Instant boot skip support with any keyboard key or casing `G0` button.
+    - `https://github.com/PinoyUnknown/ghost-firmware`
+  - **Phase 2 (3.2 Seconds):** Big Cyberpunk Neon Typography Screen:
+    ```text
+    ========
+    FUTURISTIC
+    SOFTWARES
+    ========
+    CYBERNETIC SYSTEMS & TACTICAL TOOLS
+    ```
+  - **Phase 3 (3.2 Seconds):** National Cyber Defense Typography Screen:
+    ```text
+    ====================================
+              "TEAM WHITE HAT"
+    ====================================
+                PHILIPPINES
+     CYBER SECURITY & DEFENSIVE TACTICS
+    ```
+  - **Instant Skip Support:** Users can immediately bypass into the main OS tools at any time by pressing any key or the casing `G0` button.
 * **Fixed Display Orientation & ST7789 Panel Offset:**
   - Enforced ST7789V2 panel geometry parameters (`panel_width = 135`, `panel_height = 240`, `offset_x = 52`, `offset_y = 40`) to fix display clipping and shift.
   - Added compile-time flag `-D M5GFX_BOARD=m5gfx::board_t::board_M5Cardputer` to prevent M5GFX from misidentifying Cardputer-Adv as M5VAMeter.
