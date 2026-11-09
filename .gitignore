@@ -61,6 +61,7 @@ CMakeLists.txt
 .python3
 .claude/scheduled_tasks.lock
 userPrefs.jsonc.mcp-session-bak
+GhostEmailBuild/
 
 # Fake-NodeDB fixture pipeline (bin/regen-fake-nodedbs.sh)
 # JSONL seeds are committed (test/fixtures/nodedb/seed_v25_*.jsonl);

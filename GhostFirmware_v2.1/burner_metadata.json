@@ -1,0 +1,37 @@
+{
+  "app_name": "Ghost OS",
+  "version": "2.1.0",
+  "author": "PinoyUnknown",
+  "description": "Ghost Firmware v2.1: Advanced responsive multi-device tactical diagnostic utility for ESP32-S3, Cardputer, and Cardputer Mesh with 14 functional tools, SX1262 LoRa probe, ESP-NOW mesh networking, cybernetic themes, and non-blocking multi-keyboard matrix engine.",
+  "category": "Tools",
+  "repository": "https://github.com/PinoyUnknown/ghost-firmware",
+  "website": "https://instagram.com/pinoyunknown",
+  "supported_boards": [
+    "m5stack-cardputer",
+    "cardputer-mesh",
+    "esp32-s3",
+    "m5stack-core2",
+    "m5stick-cplus"
+  ],
+  "binaries": {
+    "m5stack-cardputer": "GhostFirmware_Cardputer.bin",
+    "cardputer-mesh": "GhostFirmware_Cardputer.bin",
+    "esp32-s3": "GhostFirmware_Cardputer.bin",
+    "m5stack-core2": "GhostFirmware_Core2.bin",
+    "m5stick-cplus": "GhostFirmware_StickCPlus.bin"
+  },
+  "keywords": [
+    "ghost",
+    "ghostfirmware",
+    "v2.1",
+    "diagnostic",
+    "wireless",
+    "mesh",
+    "lora",
+    "esp-now",
+    "cyberpunk",
+    "cardputer",
+    "cardputer-mesh",
+    "esp32-s3"
+  ]
+}

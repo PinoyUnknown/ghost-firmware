@@ -1,0 +1,1875 @@
+﻿diff --git a/src/ghost_app/main.cpp b/src/ghost_app/main.cpp
+index 8256b80..92ac522 100644
+--- a/src/ghost_app/main.cpp
++++ b/src/ghost_app/main.cpp
+@@ -1,11 +1,14 @@
+ #include <M5Unified.h>
+ #include <BLEDevice.h>
++#include <Preferences.h>
++#include <SPIFFS.h>
+ #include <WiFi.h>
+ #include <Wire.h>
+-#include <SPIFFS.h>
++#include <driver/gpio.h>
+ #include <esp_sntp.h>
+-#include <time.h>
++#include <esp_system.h>
+ #include <sys/time.h>
++#include <time.h>
+ 
+ #include "theme_assets.h"
+ 
+@@ -19,14 +22,14 @@
+ namespace
+ {
+ 
++constexpr char kFirmwareVersion[] = "v1.2.0";
++constexpr char kDeveloperTag[] = "DEV: www.instagram.com/pinoyunknown";
++
+ constexpr uint8_t kKeyboardAddress = 0x34;
+ constexpr uint8_t kKeyboardAddressAlternate = 0x5F;
+ constexpr uint8_t kKeyEventCountRegister = 0x03;
+ constexpr uint8_t kKeyEventRegister = 0x04;
+ constexpr uint8_t kMaxKeysPerRead = 10;
+-constexpr int16_t kThemeColor = cyberpunkPrimaryColor;
+-constexpr int16_t kAccentColor = cyberpunkAccentColor;
+-constexpr int16_t kBackgroundColor = cyberpunkBackgroundColor;
+ 
+ constexpr uint8_t kKeySelect = 0x0D;
+ constexpr uint8_t kKeyBackspace = 0x08;
+@@ -35,32 +38,69 @@ constexpr uint8_t kKeyLeft = 0xB4;
+ constexpr uint8_t kKeyUp = 0xB5;
+ constexpr uint8_t kKeyDown = 0xB6;
+ constexpr uint8_t kKeyRight = 0xB7;
+-constexpr uint8_t kKeyShift = 0x06;
+-constexpr uint8_t kKeyFunction = 0x02;
++constexpr uint8_t kKeyShift = 6;
++constexpr uint8_t kKeyFunction = 2;
+ constexpr uint8_t kKeyboardRows = 7;
+ constexpr uint8_t kKeyboardColumns = 8;
++constexpr uint8_t kTotalKeys = 56;
+ constexpr uint8_t kThemeCount = 14;
+ constexpr size_t kMaxSurveyResults = 64;
+ constexpr size_t kVisibleResults = 5;
+ constexpr size_t kMaxFileEntries = 64;
++constexpr uint8_t kCardputerIrPin = 44;
++constexpr uint8_t kGroveSdaPin = 2;
++constexpr uint8_t kGroveSclPin = 1;
++
++constexpr std::array<uint8_t, 3> kMatrixOutputPins = {8, 9, 11};
++constexpr std::array<uint8_t, 7> kMatrixInputPins = {13, 15, 3, 4, 5, 6, 7};
++
++enum class KeyboardDriver : uint8_t {
++    None = 0,
++    GpioMatrix74HC138 = 1,
++    Tca8418I2c = 2,
++    CardKbI2c = 3,
++};
+ 
+-constexpr uint8_t kKeyMap[56][3] = {
+-    {'`', '~', kKeyEscape}, {'\t', 0, 0},                         {0, 0, 0},             {0, 0, 0},
+-    {'1', '!', 0},           {'q', 'Q', 0x90},                    {0, 0, 0},             {0, 0, 0},
+-    {'2', '@', 0},           {'w', 'W', 0},                       {'a', 'A', 0},          {0, 0, 0},
+-    {'3', '#', 0},           {'e', 'E', 0},                       {'s', 'S', 0},          {'z', 'Z', 0},
+-    {'4', '$', 0},           {'r', 'R', 0},                       {'d', 'D', 0},          {'x', 'X', 0},
+-    {'5', '%', 0},           {'t', 'T', 0},                       {'f', 'F', 0},          {'c', 'C', 0},
+-    {'6', '^', 0},           {'y', 'Y', 0},                       {'g', 'G', 0x9E},       {'v', 'V', 0},
+-    {'7', '&', 0},           {'u', 'U', 0},                       {'h', 'H', 0},          {'b', 'B', 0xAA},
+-    {'8', '*', 0},           {'i', 'I', 0},                       {'j', 'J', 0},          {'n', 'N', 0},
+-    {'9', '(', 0},           {'o', 'O', 0},                       {'k', 'K', 0},          {'m', 'M', 0xAC},
+-    {'0', ')', 0},           {'p', 'P', 0xAF},                    {'l', 'L', 0},          {',', '<', kKeyLeft},
+-    {'_', '-', 0},           {'[', '{', 0},                       {';', ':', kKeyUp},     {'.', '>', kKeyDown},
+-    {'=', '+', 0},           {']', '}', 0},                       {'\'', '"', 0},        {'/', '?', kKeyRight},
+-    {kKeyBackspace, 0, 0},   {'\\', '|', 0},                      {kKeySelect, 0, 0},     {' ', ' ', ' '}};
+-
+-enum class Screen : uint8_t { Home, Feature, SurveyDetail, FilePreview };
++struct ColorPalette
++{
++    const char *name;
++    uint16_t background;
++    uint16_t primary;
++    uint16_t accent;
++    uint16_t text;
++};
++
++constexpr std::array<ColorPalette, 5> kPalettes = {{
++    {"CYBERPUNK 2077", cyberpunkBackgroundColor, cyberpunkPrimaryColor, cyberpunkAccentColor, 0xFFFF},
++    {"HACKER MATRIX", 0x0000, 0x07E0, 0x03E0, 0xB7E0},
++    {"TRON SYSTEM", 0x0000, 0x05FF, 0xFD20, 0xFFFF},
++    {"FUTURE SCI-FI", 0x0841, 0x07FF, 0xF81F, 0xEFEF},
++    {"PINK CANDY", 0x180F, 0xF81F, 0xFD20, 0xFFFF},
++}};
++
++constexpr uint8_t kKeyMap[kTotalKeys][3] = {
++    {'`', '~', kKeyEscape}, {'\t', 0, 0},          {0, 0, 0},      {0, 0, 0},
++    {'1', '!', 0},          {'q', 'Q', 0x90},      {0, 0, 0},      {0, 0, 0},
++    {'2', '@', 0},          {'w', 'W', 0},         {'a', 'A', 0},  {0, 0, 0},
++    {'3', '#', 0},          {'e', 'E', 0},         {'s', 'S', 0},  {'z', 'Z', 0},
++    {'4', '$', 0},          {'r', 'R', 0},         {'d', 'D', 0},  {'x', 'X', 0},
++    {'5', '%', 0},          {'t', 'T', 0},         {'f', 'F', 0},  {'c', 'C', 0},
++    {'6', '^', 0},          {'y', 'Y', 0},         {'g', 'G', 0},  {'v', 'V', 0},
++    {'7', '&', 0},          {'u', 'U', 0},         {'h', 'H', 0},  {'b', 'B', 0},
++    {'8', '*', 0},          {'i', 'I', 0},         {'j', 'J', 0},  {'n', 'N', 0},
++    {'9', '(', 0},          {'o', 'O', 0},         {'k', 'K', 0},  {'m', 'M', 0},
++    {'0', ')', 0},          {'p', 'P', 0},         {'l', 'L', 0},  {',', '<', kKeyLeft},
++    {'-', '_', 0},          {'[', '{', 0},         {';', ':', kKeyUp}, {'.', '>', kKeyDown},
++    {'=', '+', 0},          {']', '}', 0},         {'\'', '"', 0}, {'/', '?', kKeyRight},
++    {kKeyBackspace, 0, 0},  {'\\', '|', 0},        {kKeySelect, 0, 0}, {' ', ' ', ' '}};
++
++enum class Screen : uint8_t {
++    Home,
++    Feature,
++    SurveyDetail,
++    FilePreview,
++    WifiPasswordEntry,
++};
+ 
+ struct AccessPoint
+ {
+@@ -89,6 +129,21 @@ struct FileEntry
+     bool isDirectory;
+ };
+ 
++struct IrCommand
++{
++    const char *label;
++    uint16_t address;
++    uint8_t command;
++};
++
++constexpr std::array<IrCommand, 5> kIrCommands = {{
++    {"NEC Diagnostic Beacon", 0x00FF, 0x00},
++    {"Generic TV Power", 0x0004, 0x08},
++    {"Generic TV Mute", 0x0004, 0x09},
++    {"Generic Volume +", 0x0004, 0x02},
++    {"Generic Volume -", 0x0004, 0x03},
++}};
++
+ struct ThemeImage
+ {
+     const uint8_t *data;
+@@ -113,23 +168,6 @@ constexpr std::array<ThemeImage, kThemeCount> themeImages = {{
+     {cyberpunkFilesImage, sizeof(cyberpunkFilesImage), "FILE"},
+ }};
+ 
+-constexpr const char *featureDetails[kThemeCount] = {
+-    "Connection tools not implemented",
+-    "Settings screen not implemented",
+-    "Cardputer uptime clock",
+-    "Passive nearby BLE survey",
+-    "Passive nearby network survey",
+-    "LoRa radio module not configured",
+-    "External nRF24 module required",
+-    "External NFC module required",
+-    "Device info screen not implemented",
+-    "No JavaScript runtime installed",
+-    "Infrared hardware support unavailable",
+-    "GPS support not configured",
+-    "External FM receiver required",
+-    "File browser support unavailable",
+-};
+-
+ class MemoryImageStream : public Stream
+ {
+   public:
+@@ -163,9 +201,12 @@ class MemoryImageStream : public Stream
+     size_t position = 0;
+ };
+ 
++Preferences settingsPrefs;
+ std::array<AccessPoint, kMaxSurveyResults> accessPoints{};
+ std::array<BluetoothDevice, kMaxSurveyResults> bluetoothDevices{};
+ std::array<FileEntry, kMaxFileEntries> fileEntries{};
++std::array<uint8_t, 16> detectedI2cAddresses{};
++size_t detectedI2cCount = 0;
+ size_t accessPointCount = 0;
+ size_t bluetoothDeviceCount = 0;
+ size_t fileEntryCount = 0;
+@@ -174,16 +215,33 @@ int16_t discoveredBluetoothDeviceCount = 0;
+ int16_t screenWidth = 240;
+ int16_t screenHeight = 135;
+ uint8_t selectedApp = 0;
+-uint8_t keyboardModifiers = 0;
++uint8_t paletteIndex = 0;
++uint8_t backdropMode = 1; // 0 = Static, 1 = Matrix Rain, 2 = Scanline
++uint8_t brightnessStep = 3; // 0=25%, 1=50%, 2=75%, 3=100%
++bool keyBeepEnabled = true;
++uint8_t selectedConfigRow = 0;
++uint8_t selectedIrIndex = 0;
++uint8_t miscPage = 0;
+ size_t selectedResult = 0;
+ size_t selectedFile = 0;
+ String currentDirectory = "/";
+ String manualTimeDigits;
+ String previewPath;
++String wifiTargetSsid;
++String wifiPasswordInput;
++String connectStatusMessage = "Ready";
++String statusBanner;
++uint32_t statusBannerUntilMs = 0;
+ size_t previewLineOffset = 0;
+ Screen currentScreen = Screen::Home;
+-bool keyboardReady = false;
++
++KeyboardDriver keyboardDriver = KeyboardDriver::None;
+ uint8_t keyboardAddress = kKeyboardAddress;
++uint8_t stickyModifiers = 0;
++uint8_t heldModifiers = 0;
++std::array<bool, kTotalKeys> previousKeyStates{};
++uint32_t lastKeyScanMs = 0;
++
+ bool scanFailed = false;
+ bool bluetoothScanFailed = false;
+ bool bluetoothReady = false;
+@@ -194,8 +252,95 @@ bool clockSyncFailed = false;
+ bool clockSyncInProgress = false;
+ bool clockSynced = false;
+ bool clockSetFailed = false;
++bool selfTestPassed = false;
++bool selfTestRan = false;
++char selfTestSummary[4][44] = {};
++char lastIrStatus[44] = "Press ENTER to send test frame";
+ time_t clockDisplaySecond = 0;
+ 
++constexpr size_t kMatrixColumns = 30;
++std::array<int16_t, kMatrixColumns> matrixY{};
++std::array<uint8_t, kMatrixColumns> matrixSpeed{};
++uint32_t lastBackdropMs = 0;
++uint16_t scanlineY = 18;
++bool btnAHandledLong = false;
++
++const ColorPalette &activePalette()
++{
++    return kPalettes[paletteIndex % kPalettes.size()];
++}
++
++uint8_t brightnessValue()
++{
++    constexpr uint8_t kValues[4] = {64, 128, 192, 255};
++    return kValues[brightnessStep & 0x03];
++}
++
++void setStatusBanner(const char *msg, uint32_t durationMs = 2200)
++{
++    statusBanner = msg;
++    statusBannerUntilMs = millis() + durationMs;
++}
++
++void loadSettings()
++{
++    if (settingsPrefs.begin("ghost_cfg", true)) {
++        paletteIndex = settingsPrefs.getUChar("palette", 0) % kPalettes.size();
++        backdropMode = settingsPrefs.getUChar("backdrop", 1) % 3;
++        brightnessStep = settingsPrefs.getUChar("bright", 3) % 4;
++        keyBeepEnabled = settingsPrefs.getBool("beep", true);
++        settingsPrefs.end();
++    }
++    M5.Display.setBrightness(brightnessValue());
++}
++
++void saveSettings()
++{
++    if (settingsPrefs.begin("ghost_cfg", false)) {
++        settingsPrefs.putUChar("palette", paletteIndex);
++        settingsPrefs.putUChar("backdrop", backdropMode);
++        settingsPrefs.putUChar("bright", brightnessStep);
++        settingsPrefs.putBool("beep", keyBeepEnabled);
++        settingsPrefs.end();
++    }
++    M5.Display.setBrightness(brightnessValue());
++}
++
++void initBackdropAnimation()
++{
++    for (size_t i = 0; i < kMatrixColumns; ++i) {
++        matrixY[i] = static_cast<int16_t>(random(-90, 0));
++        matrixSpeed[i] = static_cast<uint8_t>(random(2, 6));
++    }
++}
++
++void ensureFilesystemReady()
++{
++    if (filesystemReady) {
++        return;
++    }
++    filesystemReady = SPIFFS.begin(true);
++    if (!filesystemReady) {
++        return;
++    }
++    if (!SPIFFS.exists("/readme.txt")) {
++        File readme = SPIFFS.open("/readme.txt", FILE_WRITE);
++        if (readme) {
++            readme.println("GHOST FIRMWARE " + String(kFirmwareVersion));
++            readme.println("By PinoyUnknown");
++            readme.println("www.instagram.com/pinoyunknown");
++            readme.println("--------------------------------");
++            readme.println("Controls:");
++            readme.println("- W/S or Arrows: Navigate");
++            readme.println("- ENTER: Open / Select");
++            readme.println("- ESC / Backspace: Back");
++            readme.println("- R: Rescan in Wi-Fi / BLE / Bus");
++            readme.println("- L: Save Wi-Fi or BLE scan log");
++            readme.close();
++        }
++    }
++}
++
+ void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t width, int32_t height)
+ {
+     const ThemeImage &asset = themeImages[index % themeImages.size()];
+@@ -208,9 +353,10 @@ void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t width, int32_t
+     const int32_t drawY = y + (height - drawHeight) / 2;
+     MemoryImageStream image(asset.data, asset.size);
+     if (!M5.Display.drawPng(&image, drawX, drawY, 0, 0, 0, 0, scale, scale)) {
+-        M5.Display.drawRect(x, y, width, height, kAccentColor);
+-        M5.Display.setTextColor(kAccentColor, kBackgroundColor);
+-        M5.Display.drawCenterString("THEME IMAGE ERROR", x + width / 2, y + height / 2);
++        const ColorPalette &pal = activePalette();
++        M5.Display.drawRect(x, y, width, height, pal.accent);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawCenterString(asset.name, x + width / 2, y + height / 2);
+     }
+ }
+ 
+@@ -222,43 +368,121 @@ bool writeKeyboardRegister(uint8_t reg, uint8_t value)
+     return Wire.endTransmission() == 0;
+ }
+ 
+-bool initializeKeyboard()
++int readKeyboardRegister(uint8_t reg)
+ {
+-    Wire.begin(8, 9, 400000);
+-    const uint8_t candidates[] = {kKeyboardAddress, kKeyboardAddressAlternate};
+-    bool found = false;
+-    for (uint8_t candidate : candidates) {
+-        Wire.beginTransmission(candidate);
+-        if (Wire.endTransmission() == 0) {
+-            keyboardAddress = candidate;
+-            found = true;
+-            break;
++    Wire.beginTransmission(keyboardAddress);
++    Wire.write(reg);
++    if (Wire.endTransmission(false) != 0 ||
++        Wire.requestFrom(keyboardAddress, static_cast<uint8_t>(1)) != 1) {
++        return -1;
++    }
++    return Wire.read();
++}
++
++void setMatrixOutput(uint8_t output)
++{
++    output &= 0x07;
++    digitalWrite(kMatrixOutputPins[0], (output & 0x01) ? HIGH : LOW);
++    digitalWrite(kMatrixOutputPins[1], (output & 0x02) ? HIGH : LOW);
++    digitalWrite(kMatrixOutputPins[2], (output & 0x04) ? HIGH : LOW);
++}
++
++uint8_t readMatrixInputs()
++{
++    uint8_t mask = 0;
++    for (size_t i = 0; i < kMatrixInputPins.size(); ++i) {
++        if (digitalRead(kMatrixInputPins[i]) == LOW) {
++            mask |= static_cast<uint8_t>(1U << i);
+         }
+     }
+-    if (!found) {
+-        return false;
++    return mask;
++}
++
++void initializeGpioMatrixKeyboard()
++{
++    for (uint8_t pin : kMatrixOutputPins) {
++        gpio_reset_pin(static_cast<gpio_num_t>(pin));
++        pinMode(pin, OUTPUT);
++        digitalWrite(pin, LOW);
++    }
++    for (uint8_t pin : kMatrixInputPins) {
++        gpio_reset_pin(static_cast<gpio_num_t>(pin));
++        pinMode(pin, INPUT_PULLUP);
+     }
++    setMatrixOutput(0);
++    previousKeyStates.fill(false);
++    keyboardDriver = KeyboardDriver::GpioMatrix74HC138;
++}
+ 
+-    constexpr uint8_t resetRegisters[][2] = {
+-        {0x23, 0x00}, {0x24, 0x00}, {0x25, 0x00}, {0x20, 0xFF}, {0x21, 0xFF}, {0x22, 0xFF},
+-        {0x26, 0x00}, {0x27, 0x00}, {0x28, 0x00}, {0x1A, 0xFF}, {0x1B, 0xFF}, {0x1C, 0xFF},
+-        {0x1D, 0x7F}, {0x1E, 0xFF}, {0x29, 0x00}, {0x2A, 0x00}, {0x2B, 0x00}, {0x02, 0x03}};
+-    for (const auto &entry : resetRegisters) {
+-        if (!writeKeyboardRegister(entry[0], entry[1])) {
+-            return false;
++bool initializeKeyboard()
++{
++    // 1. Probe for Cardputer-Adv TCA8418 I2C controller at 0x34 on GPIO 8/9
++    Wire.begin(8, 9, 400000);
++    Wire.beginTransmission(kKeyboardAddress);
++    if (Wire.endTransmission() == 0) {
++        keyboardAddress = kKeyboardAddress;
++        constexpr uint8_t resetRegisters[][2] = {
++            {0x23, 0x00}, {0x24, 0x00}, {0x25, 0x00}, {0x20, 0xFF}, {0x21, 0xFF}, {0x22, 0xFF},
++            {0x26, 0x00}, {0x27, 0x00}, {0x28, 0x00}, {0x1A, 0xFF}, {0x1B, 0xFF}, {0x1C, 0xFF},
++            {0x1D, 0x7F}, {0x1E, 0xFF}, {0x29, 0x00}, {0x2A, 0x00}, {0x2B, 0x00}, {0x02, 0x03}};
++        bool ok = true;
++        for (const auto &entry : resetRegisters) {
++            if (!writeKeyboardRegister(entry[0], entry[1])) {
++                ok = false;
++                break;
++            }
++        }
++        if (ok) {
++            while (readKeyboardRegister(kKeyEventCountRegister) > 0) {
++                (void)readKeyboardRegister(kKeyEventRegister);
++            }
++            keyboardDriver = KeyboardDriver::Tca8418I2c;
++            return true;
+         }
+     }
++    Wire.end();
++
++    // 2. Standard M5Stack Cardputer v1.0 / v1.1 uses 74HC138 GPIO Matrix on pins {8,9,11} -> {13,15,3,4,5,6,7}
++    initializeGpioMatrixKeyboard();
+     return true;
+ }
+ 
+-int readKeyboardRegister(uint8_t reg)
++const char *keyboardDriverLabel()
+ {
+-    Wire.beginTransmission(keyboardAddress);
+-    Wire.write(reg);
+-    if (Wire.endTransmission(false) != 0 || Wire.requestFrom(keyboardAddress, static_cast<uint8_t>(1)) != 1) {
+-        return -1;
++    switch (keyboardDriver) {
++    case KeyboardDriver::GpioMatrix74HC138:
++        return "74HC138 MATRIX";
++    case KeyboardDriver::Tca8418I2c:
++        return "TCA8418 I2C";
++    case KeyboardDriver::CardKbI2c:
++        return "CARDKB I2C";
++    default:
++        return "BUTTON ONLY";
+     }
+-    return Wire.read();
++}
++
++bool isTextEntryScreen()
++{
++    return manualTimeEntry || currentScreen == Screen::WifiPasswordEntry;
++}
++
++uint8_t translateKeyIndex(uint8_t keyIndex, uint8_t activeMods)
++{
++    if (keyIndex >= kTotalKeys) {
++        return 0;
++    }
++    // When navigating menus/lists (not typing text), allow direct arrow/esc keys (; . , / `) without holding Fn
++    if (!isTextEntryScreen() && (activeMods & 0x03) == 0) {
++        if (keyIndex == 0 || keyIndex == 43 || keyIndex == 46 || keyIndex == 47 || keyIndex == 51) {
++            return kKeyMap[keyIndex][2];
++        }
++    }
++    const uint8_t layer = (activeMods & 0x02) ? 2 : ((activeMods & 0x01) ? 1 : 0);
++    uint8_t mapped = kKeyMap[keyIndex][layer];
++    if (mapped == 0 && layer != 0) {
++        mapped = kKeyMap[keyIndex][0];
++    }
++    return mapped;
+ }
+ 
+ const char *securityName(wifi_auth_mode_t security)
+@@ -273,7 +497,7 @@ const char *securityName(wifi_auth_mode_t security)
+     case WIFI_AUTH_WPA2_PSK:
+         return "WPA2";
+     case WIFI_AUTH_WPA_WPA2_PSK:
+-        return "WPA MIX";
++        return "WPA/2";
+     case WIFI_AUTH_WPA2_ENTERPRISE:
+         return "ENT";
+     case WIFI_AUTH_WPA3_PSK:
+@@ -319,9 +543,28 @@ void scanNearbyAccessPoints()
+     }
+ 
+     WiFi.scanDelete();
+-    if (previousMode == WIFI_MODE_NULL) {
+-        WiFi.mode(WIFI_MODE_NULL);
++}
++
++void saveWifiSurveyLog()
++{
++    ensureFilesystemReady();
++    if (!filesystemReady) {
++        setStatusBanner("SPIFFS unavailable");
++        return;
++    }
++    File f = SPIFFS.open("/wifi_scan.txt", FILE_WRITE);
++    if (!f) {
++        setStatusBanner("Failed to write /wifi_scan.txt");
++        return;
+     }
++    f.printf("GHOST WIFI SURVEY (%u APs)\n", static_cast<unsigned>(accessPointCount));
++    for (size_t i = 0; i < accessPointCount; ++i) {
++        const AccessPoint &ap = accessPoints[i];
++        f.printf("%02u: %s | %ddBm | CH%u | %s | %s\n", static_cast<unsigned>(i + 1), ap.ssid, ap.rssi,
++                 ap.channel, securityName(ap.security), ap.bssid);
++    }
++    f.close();
++    setStatusBanner("Saved /wifi_scan.txt");
+ }
+ 
+ void scanNearbyBluetoothDevices()
+@@ -366,14 +609,34 @@ void scanNearbyBluetoothDevices()
+     scanner->clearResults();
+ }
+ 
++void saveBleSurveyLog()
++{
++    ensureFilesystemReady();
++    if (!filesystemReady) {
++        setStatusBanner("SPIFFS unavailable");
++        return;
++    }
++    File f = SPIFFS.open("/ble_scan.txt", FILE_WRITE);
++    if (!f) {
++        setStatusBanner("Failed to write /ble_scan.txt");
++        return;
++    }
++    f.printf("GHOST BLE SURVEY (%u advertisers)\n", static_cast<unsigned>(bluetoothDeviceCount));
++    for (size_t i = 0; i < bluetoothDeviceCount; ++i) {
++        const BluetoothDevice &dev = bluetoothDevices[i];
++        f.printf("%02u: %s | %s | %ddBm | svc:%u mfg:%uB\n", static_cast<unsigned>(i + 1), dev.name,
++                 dev.address, dev.rssi, dev.serviceCount, dev.manufacturerDataBytes);
++    }
++    f.close();
++    setStatusBanner("Saved /ble_scan.txt");
++}
++
+ void loadFileList()
+ {
+     fileEntryCount = 0;
+     selectedFile = 0;
+     fileListingFailed = false;
+-    if (!filesystemReady) {
+-        filesystemReady = SPIFFS.begin(false);
+-    }
++    ensureFilesystemReady();
+     if (!filesystemReady) {
+         fileListingFailed = true;
+         return;
+@@ -401,11 +664,16 @@ void loadFileList()
+     File entry = directory.openNextFile();
+     while (entry && fileEntryCount < fileEntries.size()) {
+         FileEntry &item = fileEntries[fileEntryCount++];
+-        const char *path = entry.name();
+-        const char *name = strrchr(path, '/');
+-        name = name == nullptr ? path : name + 1;
+-        strlcpy(item.name, name, sizeof(item.name));
+-        strlcpy(item.path, path, sizeof(item.path));
++        const char *path = entry.path();
++        const char *rawName = entry.name();
++        const char *leaf = strrchr(rawName, '/');
++        leaf = leaf == nullptr ? rawName : leaf + 1;
++        strlcpy(item.name, leaf, sizeof(item.name));
++        if (path != nullptr && path[0] == '/') {
++            strlcpy(item.path, path, sizeof(item.path));
++        } else {
++            snprintf(item.path, sizeof(item.path), "/%s", leaf);
++        }
+         item.size = static_cast<uint32_t>(entry.size());
+         item.isDirectory = entry.isDirectory();
+         entry.close();
+@@ -414,6 +682,134 @@ void loadFileList()
+     directory.close();
+ }
+ 
++void connectToSelectedWifi()
++{
++    WiFi.mode(WIFI_MODE_STA);
++    WiFi.disconnect(false, false);
++    delay(50);
++    if (wifiPasswordInput.isEmpty()) {
++        WiFi.begin(wifiTargetSsid.c_str());
++    } else {
++        WiFi.begin(wifiTargetSsid.c_str(), wifiPasswordInput.c_str());
++    }
++    connectStatusMessage = "Connecting to " + wifiTargetSsid + "...";
++    const uint32_t startMs = millis();
++    while (WiFi.status() != WL_CONNECTED && millis() - startMs < 7000) {
++        delay(150);
++    }
++    if (WiFi.status() == WL_CONNECTED) {
++        connectStatusMessage = "Connected: " + WiFi.localIP().toString();
++        setStatusBanner("Wi-Fi connected!");
++    } else {
++        connectStatusMessage = "Connect failed (check password/signal)";
++        setStatusBanner("Wi-Fi connection failed");
++    }
++}
++
++void runNetworkConnectivityTest()
++{
++    if (WiFi.status() != WL_CONNECTED) {
++        connectStatusMessage = "Not connected to Wi-Fi";
++        setStatusBanner("Connect to Wi-Fi first");
++        return;
++    }
++    IPAddress resolvedIp;
++    const uint32_t startMs = millis();
++    if (WiFi.hostByName("pool.ntp.org", resolvedIp)) {
++        const uint32_t elapsed = millis() - startMs;
++        connectStatusMessage = "DNS OK: " + resolvedIp.toString() + " (" + String(elapsed) + "ms)";
++        setStatusBanner("Network DNS test passed");
++    } else {
++        connectStatusMessage = "DNS lookup failed (no internet?)";
++        setStatusBanner("DNS lookup failed");
++    }
++}
++
++void scanGroveI2cBus()
++{
++    detectedI2cCount = 0;
++    Wire1.begin(kGroveSdaPin, kGroveSclPin, 100000);
++    for (uint8_t addr = 0x08; addr < 0x78 && detectedI2cCount < detectedI2cAddresses.size(); ++addr) {
++        Wire1.beginTransmission(addr);
++        if (Wire1.endTransmission() == 0) {
++            detectedI2cAddresses[detectedI2cCount++] = addr;
++        }
++    }
++    Wire1.end();
++}
++
++void sendNecPulse(uint32_t markUs, uint32_t spaceUs)
++{
++    const uint32_t cycles = markUs / 26;
++    for (uint32_t i = 0; i < cycles; ++i) {
++        digitalWrite(kCardputerIrPin, HIGH);
++        delayMicroseconds(9);
++        digitalWrite(kCardputerIrPin, LOW);
++        delayMicroseconds(17);
++    }
++    delayMicroseconds(spaceUs);
++}
++
++void transmitIrCommand(const IrCommand &cmd)
++{
++    pinMode(kCardputerIrPin, OUTPUT);
++    digitalWrite(kCardputerIrPin, LOW);
++
++    const uint32_t frame = static_cast<uint32_t>(cmd.address & 0xFFFF) |
++                           (static_cast<uint32_t>(cmd.command) << 16) |
++                           (static_cast<uint32_t>(static_cast<uint8_t>(~cmd.command)) << 24);
++
++    sendNecPulse(9000, 4500);
++    for (uint8_t bit = 0; bit < 32; ++bit) {
++        if ((frame >> bit) & 0x01U) {
++            sendNecPulse(560, 1690);
++        } else {
++            sendNecPulse(560, 560);
++        }
++    }
++    sendNecPulse(560, 2000);
++    digitalWrite(kCardputerIrPin, LOW);
++
++    snprintf(lastIrStatus, sizeof(lastIrStatus), "Sent %s (0x%02X) on G%u", cmd.label, cmd.command,
++             kCardputerIrPin);
++    setStatusBanner("IR pulse sent on GPIO 44");
++}
++
++void runHardwareSelfTest()
++{
++    ensureFilesystemReady();
++    const int32_t batLevel = M5.Power.getBatteryLevel();
++    const int32_t batMv = M5.Power.getBatteryVoltage();
++    const bool wifiOk = WiFi.mode(WIFI_MODE_STA);
++
++    snprintf(selfTestSummary[0], sizeof(selfTestSummary[0]), "1.DISP: %dx%d OK  KB: %s", screenWidth,
++             screenHeight, keyboardDriverLabel());
++    snprintf(selfTestSummary[1], sizeof(selfTestSummary[1]), "2.PWR : BAT %ld%% (%ldmV) HEAP %luK",
++             static_cast<long>(batLevel), static_cast<long>(batMv),
++             static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
++    snprintf(selfTestSummary[2], sizeof(selfTestSummary[2]), "3.FS  : SPIFFS %s (%lu/%luKB)",
++             filesystemReady ? "OK" : "ERR",
++             filesystemReady ? static_cast<unsigned long>(SPIFFS.usedBytes() / 1024) : 0UL,
++             filesystemReady ? static_cast<unsigned long>(SPIFFS.totalBytes() / 1024) : 0UL);
++    snprintf(selfTestSummary[3], sizeof(selfTestSummary[3]), "4.RF  : WIFI=%s  IR=G%u READY",
++             wifiOk ? "OK" : "ERR", kCardputerIrPin);
++
++    selfTestPassed = filesystemReady && wifiOk;
++    selfTestRan = true;
++
++    if (filesystemReady) {
++        File report = SPIFFS.open("/selftest.txt", FILE_WRITE);
++        if (report) {
++            report.println("GHOST OS SELF-TEST REPORT");
++            for (const auto &line : selfTestSummary) {
++                report.println(line);
++            }
++            report.close();
++        }
++    }
++    setStatusBanner("Self-test saved to /selftest.txt");
++}
++
+ void beginManualTimeEntry()
+ {
+     manualTimeDigits = "";
+@@ -466,6 +862,7 @@ void saveManualTime()
+     manualTimeDigits = "";
+     clockSynced = false;
+     clockSetFailed = false;
++    setStatusBanner("UTC clock updated");
+ }
+ 
+ void syncClockFromNetwork()
+@@ -482,13 +879,13 @@ void syncClockFromNetwork()
+     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+     struct tm current = {};
+     bool synced = false;
+-    for (uint8_t attempt = 0; attempt < 48; ++attempt) {
++    for (uint8_t attempt = 0; attempt < 40; ++attempt) {
+         if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED && getLocalTime(&current, 100) &&
+             current.tm_year >= 124) {
+             synced = true;
+             break;
+         }
+-        delay(250);
++        delay(200);
+     }
+     clockSynced = synced;
+     clockSyncFailed = !synced;
+@@ -499,173 +896,476 @@ void syncClockFromNetwork()
+     }
+ }
+ 
+-void drawHome()
++void drawBackdropOverlay()
+ {
+-    M5.Display.fillScreen(kBackgroundColor);
+-    drawThemeImage(selectedApp, 0, 0, screenWidth, screenHeight - 25);
+-    M5.Display.fillRect(0, screenHeight - 25, screenWidth, 25, kBackgroundColor);
+-    M5.Display.drawFastHLine(0, screenHeight - 25, screenWidth, kAccentColor);
+-    M5.Display.setTextDatum(textdatum_t::middle_center);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+-    M5.Display.drawString(keyboardReady ? "W/S OR FN+ARROWS: MOVE" : "KEYBOARD NOT FOUND",
+-                          screenWidth / 2, screenHeight - 19);
+-    M5.Display.setTextColor(kAccentColor, kBackgroundColor);
+-    M5.Display.drawString("ENTER / BtnA: OPEN", screenWidth / 2, screenHeight - 7);
++    const ColorPalette &pal = activePalette();
++    if (backdropMode == 1) {
++        const size_t cols = std::min<size_t>(kMatrixColumns, screenWidth / 8);
++        M5.Display.setTextSize(1);
++        M5.Display.setTextColor(0x03E0, pal.background);
++        for (size_t i = 0; i < cols; ++i) {
++            if (matrixY[i] >= 16 && matrixY[i] < screenHeight - 16) {
++                const char glyph = static_cast<char>(random(33, 95));
++                M5.Display.drawChar(glyph, static_cast<int32_t>(i * 8), matrixY[i]);
++            }
++            matrixY[i] = static_cast<int16_t>(matrixY[i] + matrixSpeed[i]);
++            if (matrixY[i] >= screenHeight - 14) {
++                matrixY[i] = static_cast<int16_t>(random(-50, 0));
++            }
++        }
++    } else if (backdropMode == 2) {
++        scanlineY = static_cast<uint16_t>(16 + ((scanlineY - 14) % (screenHeight - 32)));
++        M5.Display.drawFastHLine(0, scanlineY, screenWidth, pal.accent);
++    }
++}
++
++void drawHeaderBar(const char *title)
++{
++    const ColorPalette &pal = activePalette();
++    M5.Display.fillRect(0, 0, screenWidth, 15, pal.background);
++    M5.Display.drawFastHLine(0, 15, screenWidth, pal.accent);
++    M5.Display.setTextSize(1);
++    M5.Display.setTextDatum(textdatum_t::middle_left);
++    M5.Display.setTextColor(pal.primary, pal.background);
++    M5.Display.drawString(title, 4, 7);
++
++    char rightInfo[28];
++    const int32_t bat = M5.Power.getBatteryLevel();
++    const char *modTag = ( (heldModifiers | stickyModifiers) & 0x02 ) ? "FN " :
++                         ( (heldModifiers | stickyModifiers) & 0x01 ) ? "SHF " : "";
++    snprintf(rightInfo, sizeof(rightInfo), "%s%sBAT:%ld%%", modTag,
++             WiFi.status() == WL_CONNECTED ? "W+ " : "", static_cast<long>(bat));
++    M5.Display.setTextDatum(textdatum_t::middle_right);
++    M5.Display.setTextColor(pal.accent, pal.background);
++    M5.Display.drawString(rightInfo, screenWidth - 4, 7);
+ }
+ 
+ void drawFooter(const char *text)
+ {
+-    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, kAccentColor);
+-    M5.Display.setTextColor(kAccentColor, kBackgroundColor);
++    const ColorPalette &pal = activePalette();
++    M5.Display.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
++    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
++    M5.Display.setTextColor(pal.accent, pal.background);
+     M5.Display.setTextDatum(textdatum_t::middle_center);
+-    M5.Display.drawString(text, screenWidth / 2, screenHeight - 6);
++    if (statusBannerUntilMs > millis() && !statusBanner.isEmpty()) {
++        M5.Display.setTextColor(pal.primary, pal.background);
++        M5.Display.drawString(statusBanner.c_str(), screenWidth / 2, screenHeight - 6);
++    } else {
++        M5.Display.drawString(text, screenWidth / 2, screenHeight - 6);
++    }
++}
++
++void drawHome()
++{
++    const ColorPalette &pal = activePalette();
++    M5.Display.fillScreen(pal.background);
++    drawThemeImage(selectedApp, 0, 14, screenWidth, screenHeight - 39);
++
++    char header[36];
++    snprintf(header, sizeof(header), "[%02u/%02u] %s", static_cast<unsigned>(selectedApp + 1),
++             static_cast<unsigned>(kThemeCount), themeImages[selectedApp].name);
++    drawHeaderBar(header);
++
++    M5.Display.fillRect(0, screenHeight - 25, screenWidth, 25, pal.background);
++    M5.Display.drawFastHLine(0, screenHeight - 25, screenWidth, pal.accent);
++    M5.Display.setTextDatum(textdatum_t::middle_center);
++    M5.Display.setTextColor(pal.primary, pal.background);
++    M5.Display.drawString("W/S OR ARROWS: MOVE  |  ENTER: OPEN", screenWidth / 2, screenHeight - 18);
++    M5.Display.setTextColor(pal.accent, pal.background);
++    M5.Display.drawString(kDeveloperTag, screenWidth / 2, screenHeight - 7);
++}
++
++void drawConnectScreen()
++{
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("CONNECT: WI-FI STATION");
++    M5.Display.setTextDatum(textdatum_t::top_left);
++    M5.Display.setTextColor(pal.text, pal.background);
++
++    char line[52];
++    const bool connected = (WiFi.status() == WL_CONNECTED);
++    snprintf(line, sizeof(line), "STATE : %s", connected ? "CONNECTED" : "DISCONNECTED");
++    M5.Display.setTextColor(connected ? pal.primary : pal.accent, pal.background);
++    M5.Display.drawString(line, 5, 20);
++
++    M5.Display.setTextColor(pal.text, pal.background);
++    if (connected) {
++        snprintf(line, sizeof(line), "SSID  : %.28s", WiFi.SSID().c_str());
++        M5.Display.drawString(line, 5, 36);
++        snprintf(line, sizeof(line), "IP    : %s (%ddBm)", WiFi.localIP().toString().c_str(), WiFi.RSSI());
++        M5.Display.drawString(line, 5, 52);
++        snprintf(line, sizeof(line), "GW/DNS: %s / %s", WiFi.gatewayIP().toString().c_str(),
++                 WiFi.dnsIP().toString().c_str());
++        M5.Display.drawString(line, 5, 68);
++    } else {
++        M5.Display.drawString("Press S to scan & select a Wi-Fi AP", 5, 38);
++        snprintf(line, sizeof(line), "MAC   : %s", WiFi.macAddress().c_str());
++        M5.Display.drawString(line, 5, 54);
++    }
++
++    M5.Display.setTextColor(pal.primary, pal.background);
++    M5.Display.drawString(connectStatusMessage.substring(0, 38).c_str(), 5, 88);
++    M5.Display.setTextColor(pal.accent, pal.background);
++    M5.Display.drawString("S:SCAN/JOIN  T:DNS TEST  D:DISC", 5, 105);
++    drawFooter("ESC: HOME");
++}
++
++void drawWifiPasswordPrompt()
++{
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("JOIN WI-FI NETWORK");
++    M5.Display.setTextDatum(textdatum_t::top_left);
++    M5.Display.setTextColor(pal.primary, pal.background);
++
++    char line[52];
++    snprintf(line, sizeof(line), "SSID: %.30s", wifiTargetSsid.c_str());
++    M5.Display.drawString(line, 5, 22);
++
++    M5.Display.setTextColor(pal.text, pal.background);
++    M5.Display.drawString("Password (leave empty if open):", 5, 42);
++    M5.Display.drawRect(4, 56, screenWidth - 8, 20, pal.accent);
++    M5.Display.setTextColor(pal.primary, pal.background);
++    M5.Display.drawString(wifiPasswordInput.c_str(), 8, 62);
++
++    M5.Display.setTextColor(pal.accent, pal.background);
++    M5.Display.drawString("ENTER: CONNECT  BACKSPACE: DELETE", 5, 86);
++    drawFooter("ESC: CANCEL");
++}
++
++void drawConfigScreen()
++{
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("CONFIG: THEME & DEVICE");
++    M5.Display.setTextDatum(textdatum_t::top_left);
++
++    constexpr const char *kBackdropNames[3] = {"STATIC", "MATRIX RAIN", "SCANLINE"};
++    constexpr uint8_t kBrightnessPcts[4] = {25, 50, 75, 100};
++
++    char rows[5][46];
++    snprintf(rows[0], sizeof(rows[0]), "Theme    : %s", pal.name);
++    snprintf(rows[1], sizeof(rows[1]), "Backdrop : %s", kBackdropNames[backdropMode % 3]);
++    snprintf(rows[2], sizeof(rows[2]), "Bright   : %u%%", kBrightnessPcts[brightnessStep & 3]);
++    snprintf(rows[3], sizeof(rows[3]), "Key Beep : %s", keyBeepEnabled ? "ON" : "OFF");
++    snprintf(rows[4], sizeof(rows[4]), "Reset Defaults & Save");
++
++    for (uint8_t i = 0; i < 5; ++i) {
++        const int16_t y = 20 + i * 19;
++        if (i == selectedConfigRow) {
++            M5.Display.fillRect(2, y - 1, screenWidth - 4, 17, pal.accent);
++            M5.Display.setTextColor(pal.background, pal.accent);
++        } else {
++            M5.Display.setTextColor(pal.text, pal.background);
++        }
++        M5.Display.drawString(rows[i], 6, y + 2);
++    }
++    drawFooter("W/S: ROW  ENTER: CHANGE  ESC: HOME");
+ }
+ 
+ void drawBluetoothSurvey()
+ {
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("BLE PASSIVE SURVEY");
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++    M5.Display.setTextColor(pal.primary, pal.background);
+     char line[48];
+     if (bluetoothScanFailed) {
+-        M5.Display.drawString("BLE survey unavailable", 5, 5);
++        M5.Display.drawString("BLE survey unavailable", 5, 22);
+         return;
+     }
+-    snprintf(line, sizeof(line), "BLE ADVERTISERS: %d  SHOWING %u", discoveredBluetoothDeviceCount,
++    snprintf(line, sizeof(line), "FOUND: %d  LISTING: %u (L:SAVE LOG)", discoveredBluetoothDeviceCount,
+              static_cast<unsigned>(bluetoothDeviceCount));
+-    M5.Display.drawString(line, 5, 4);
++    M5.Display.drawString(line, 5, 18);
+     if (bluetoothDeviceCount == 0) {
+-        M5.Display.drawString("No advertisers found", 5, 27);
++        M5.Display.drawString("No advertisers found (Press R)", 5, 42);
+         return;
+     }
+-    const size_t first = selectedResult >= kVisibleResults ? selectedResult - kVisibleResults + 1 : 0;
+-    for (size_t row = 0; row < kVisibleResults && first + row < bluetoothDeviceCount; ++row) {
++    const size_t first = selectedResult >= 4 ? selectedResult - 3 : 0;
++    for (size_t row = 0; row < 4 && first + row < bluetoothDeviceCount; ++row) {
+         const size_t index = first + row;
+         const BluetoothDevice &device = bluetoothDevices[index];
+-        const int16_t y = 21 + static_cast<int16_t>(row) * 19;
++        const int16_t y = 34 + static_cast<int16_t>(row) * 20;
+         if (index == selectedResult) {
+-            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+-            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
++            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, pal.accent);
++            M5.Display.setTextColor(pal.background, pal.accent);
+         } else {
+-            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++            M5.Display.setTextColor(pal.text, pal.background);
+         }
+         snprintf(line, sizeof(line), "%.17s %ddBm", device.name, device.rssi);
+-        M5.Display.drawString(line, 5, y);
++        M5.Display.drawString(line, 5, y + 2);
+     }
+ }
+ 
+ void drawWifiSurvey()
+ {
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("WI-FI PASSIVE SURVEY");
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++    M5.Display.setTextColor(pal.primary, pal.background);
+     char line[52];
+     if (scanFailed) {
+-        M5.Display.drawString("Wi-Fi survey unavailable", 5, 5);
++        M5.Display.drawString("Wi-Fi survey unavailable", 5, 22);
+         return;
+     }
+-    snprintf(line, sizeof(line), "NETWORKS: %d  SHOWING %u", discoveredAccessPointCount,
++    snprintf(line, sizeof(line), "APs: %d  SHOW: %u (C:JOIN L:SAVE)", discoveredAccessPointCount,
+              static_cast<unsigned>(accessPointCount));
+-    M5.Display.drawString(line, 5, 4);
++    M5.Display.drawString(line, 5, 18);
+     if (accessPointCount == 0) {
+-        M5.Display.drawString("No networks found", 5, 27);
++        M5.Display.drawString("No networks found (Press R)", 5, 42);
+         return;
+     }
+-    const size_t first = selectedResult >= kVisibleResults ? selectedResult - kVisibleResults + 1 : 0;
+-    for (size_t row = 0; row < kVisibleResults && first + row < accessPointCount; ++row) {
++    const size_t first = selectedResult >= 4 ? selectedResult - 3 : 0;
++    for (size_t row = 0; row < 4 && first + row < accessPointCount; ++row) {
+         const size_t index = first + row;
+         const AccessPoint &network = accessPoints[index];
+-        const int16_t y = 21 + static_cast<int16_t>(row) * 19;
++        const int16_t y = 34 + static_cast<int16_t>(row) * 20;
+         if (index == selectedResult) {
+-            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+-            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
++            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, pal.accent);
++            M5.Display.setTextColor(pal.background, pal.accent);
+         } else {
+-            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++            M5.Display.setTextColor(pal.text, pal.background);
+         }
+         snprintf(line, sizeof(line), "%.14s %4ddBm C%02u %s", network.ssid, network.rssi, network.channel,
+                  securityName(network.security));
+-        M5.Display.drawString(line, 5, y);
++        M5.Display.drawString(line, 5, y + 2);
+     }
+ }
+ 
+ void drawSurveyDetail()
+ {
++    const ColorPalette &pal = activePalette();
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+     char line[52];
+     if (selectedApp == 4 && selectedResult < accessPointCount) {
+         const AccessPoint &network = accessPoints[selectedResult];
+-        M5.Display.drawString("WI-FI ACCESS POINT", 5, 5);
++        drawHeaderBar("WI-FI AP DETAILS");
++        M5.Display.setTextColor(pal.primary, pal.background);
+         snprintf(line, sizeof(line), "SSID: %.30s", network.ssid);
+-        M5.Display.drawString(line, 5, 26);
++        M5.Display.drawString(line, 5, 22);
++        M5.Display.setTextColor(pal.text, pal.background);
+         snprintf(line, sizeof(line), "BSSID: %s", network.bssid);
+-        M5.Display.drawString(line, 5, 44);
+-        snprintf(line, sizeof(line), "RSSI: %d dBm  CHANNEL: %u", network.rssi, network.channel);
+-        M5.Display.drawString(line, 5, 62);
+-        snprintf(line, sizeof(line), "SECURITY: %s", securityName(network.security));
+-        M5.Display.drawString(line, 5, 80);
+-        M5.Display.drawString("Passive beacon scan; no connection", 5, 99);
++        M5.Display.drawString(line, 5, 40);
++        snprintf(line, sizeof(line), "RSSI : %d dBm  CH: %u", network.rssi, network.channel);
++        M5.Display.drawString(line, 5, 58);
++        snprintf(line, sizeof(line), "AUTH : %s", securityName(network.security));
++        M5.Display.drawString(line, 5, 76);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString("Press C to connect to this AP", 5, 96);
+     } else if (selectedApp == 3 && selectedResult < bluetoothDeviceCount) {
+         const BluetoothDevice &device = bluetoothDevices[selectedResult];
+-        M5.Display.drawString("BLE ADVERTISEMENT", 5, 5);
++        drawHeaderBar("BLE ADVERTISEMENT");
++        M5.Display.setTextColor(pal.primary, pal.background);
+         snprintf(line, sizeof(line), "NAME: %.30s", device.name);
+-        M5.Display.drawString(line, 5, 26);
+-        snprintf(line, sizeof(line), "ADDRESS: %s", device.address);
+-        M5.Display.drawString(line, 5, 44);
+-        snprintf(line, sizeof(line), "RSSI: %d dBm", device.rssi);
+-        M5.Display.drawString(line, 5, 62);
+-        snprintf(line, sizeof(line), "SERVICES: %u  MFG DATA: %uB", device.serviceCount,
+-                 device.manufacturerDataBytes);
+-        M5.Display.drawString(line, 5, 80);
+-        snprintf(line, sizeof(line), "UUID: %.32s", device.firstServiceUuid[0] ? device.firstServiceUuid : "none");
+-        M5.Display.drawString(line, 5, 98);
++        M5.Display.drawString(line, 5, 22);
++        M5.Display.setTextColor(pal.text, pal.background);
++        snprintf(line, sizeof(line), "ADDR: %s", device.address);
++        M5.Display.drawString(line, 5, 40);
++        snprintf(line, sizeof(line), "RSSI: %d dBm  SVC: %u", device.rssi, device.serviceCount);
++        M5.Display.drawString(line, 5, 58);
++        snprintf(line, sizeof(line), "MFG : %u bytes", device.manufacturerDataBytes);
++        M5.Display.drawString(line, 5, 76);
++        snprintf(line, sizeof(line), "UUID: %.30s",
++                 device.firstServiceUuid[0] ? device.firstServiceUuid : "none");
++        M5.Display.drawString(line, 5, 94);
+     }
+-    drawFooter("ESC: BACK");
++    drawFooter("ESC: BACK TO LIST");
+ }
+ 
+ void drawClock()
+ {
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("UTC CLOCK & UPTIME");
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+-    M5.Display.drawString("UTC CLOCK", 5, 5);
++    M5.Display.setTextColor(pal.primary, pal.background);
+     if (manualTimeEntry) {
+-        M5.Display.drawString("SET YYYYMMDDhhmmss:", 5, 30);
+-        M5.Display.drawString(manualTimeDigits.c_str(), 5, 53);
+-        M5.Display.drawString("14 digits, ENTER saves", 5, 76);
+-        M5.Display.drawString("BACKSPACE edits", 5, 94);
++        M5.Display.drawString("SET YYYYMMDDhhmmss:", 5, 24);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString(manualTimeDigits.c_str(), 5, 44);
++        M5.Display.setTextColor(pal.text, pal.background);
++        M5.Display.drawString("14 digits, ENTER saves", 5, 66);
++        M5.Display.drawString("BACKSPACE edits", 5, 84);
+         if (clockSetFailed) {
+-            M5.Display.drawString("Invalid date/time", 5, 111);
++            M5.Display.setTextColor(0xF800, pal.background);
++            M5.Display.drawString("Invalid date/time!", 5, 102);
+         }
+     } else {
+         const time_t now = time(nullptr);
+         struct tm value = {};
+         char line[48];
+         if (now >= 1700000000 && gmtime_r(&now, &value) != nullptr) {
+-            strftime(line, sizeof(line), "%Y-%m-%d", &value);
+-            M5.Display.drawString(line, 5, 34);
+-            strftime(line, sizeof(line), "%H:%M:%S UTC", &value);
+-            M5.Display.drawString(line, 5, 55);
++            strftime(line, sizeof(line), "DATE  : %Y-%m-%d", &value);
++            M5.Display.drawString(line, 5, 22);
++            strftime(line, sizeof(line), "UTC   : %H:%M:%S", &value);
++            M5.Display.drawString(line, 5, 40);
+             snprintf(line, sizeof(line), "SOURCE: %s", clockSynced ? "NTP" : "MANUAL/RTC");
+-            M5.Display.drawString(line, 5, 78);
++            M5.Display.setTextColor(pal.text, pal.background);
++            M5.Display.drawString(line, 5, 58);
+         } else {
+-            M5.Display.drawString("Time not set", 5, 34);
++            M5.Display.drawString("UTC Time not set yet", 5, 24);
+         }
++        const uint32_t upSec = millis() / 1000;
++        snprintf(line, sizeof(line), "UPTIME: %02lu:%02lu:%02lu",
++                 static_cast<unsigned long>(upSec / 3600),
++                 static_cast<unsigned long>((upSec % 3600) / 60),
++                 static_cast<unsigned long>(upSec % 60));
++        M5.Display.setTextColor(pal.text, pal.background);
++        M5.Display.drawString(line, 5, 76);
++
++        M5.Display.setTextColor(pal.accent, pal.background);
+         if (clockSyncInProgress) {
+-            M5.Display.drawString("Syncing network time...", 5, 98);
++            M5.Display.drawString("Syncing NTP time...", 5, 96);
+         } else if (clockSyncFailed) {
+-            M5.Display.drawString("NTP failed; check saved Wi-Fi", 5, 98);
++            M5.Display.drawString("NTP failed (connect Wi-Fi in CONNECT)", 5, 96);
+         } else {
+-            M5.Display.drawString("N: NTP SYNC  M: SET TIME", 5, 98);
++            M5.Display.drawString("N: NTP SYNC  |  M: MANUAL SET", 5, 96);
+         }
+     }
+-    drawFooter("ESC: BACK");
++    drawFooter("ESC: HOME");
+ }
+ 
+-void drawFileBrowser()
++void drawIrDiagnosticScreen()
++{
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("IR TX DIAGNOSTIC (GPIO 44)");
++    M5.Display.setTextDatum(textdatum_t::top_left);
++
++    for (size_t i = 0; i < kIrCommands.size(); ++i) {
++        const int16_t y = 19 + static_cast<int16_t>(i) * 16;
++        char row[48];
++        snprintf(row, sizeof(row), "%s [0x%02X]", kIrCommands[i].label, kIrCommands[i].command);
++        if (i == selectedIrIndex) {
++            M5.Display.fillRect(2, y - 1, screenWidth - 4, 15, pal.accent);
++            M5.Display.setTextColor(pal.background, pal.accent);
++        } else {
++            M5.Display.setTextColor(pal.text, pal.background);
++        }
++        M5.Display.drawString(row, 5, y + 1);
++    }
++
++    M5.Display.setTextColor(pal.primary, pal.background);
++    M5.Display.drawString(lastIrStatus, 5, 103);
++    drawFooter("W/S: SELECT  ENTER: SEND IR  ESC: HOME");
++}
++
++void drawMiscTelemetryScreen()
++{
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar(miscPage == 0 ? "MISC: SYSTEM TELEMETRY (1/2)" : "MISC: RADIO & VERSION (2/2)");
++    M5.Display.setTextDatum(textdatum_t::top_left);
++    M5.Display.setTextColor(pal.text, pal.background);
++
++    char line[52];
++    if (miscPage == 0) {
++        snprintf(line, sizeof(line), "MCU  : %s @ %luMHz", ESP.getChipModel(),
++                 static_cast<unsigned long>(ESP.getCpuFreqMHz()));
++        M5.Display.drawString(line, 5, 22);
++        snprintf(line, sizeof(line), "BAT  : %ld%% (%ld mV)",
++                 static_cast<long>(M5.Power.getBatteryLevel()),
++                 static_cast<long>(M5.Power.getBatteryVoltage()));
++        M5.Display.drawString(line, 5, 39);
++        snprintf(line, sizeof(line), "HEAP : %lu / %lu KB free",
++                 static_cast<unsigned long>(ESP.getFreeHeap() / 1024),
++                 static_cast<unsigned long>(ESP.getHeapSize() / 1024));
++        M5.Display.drawString(line, 5, 56);
++        snprintf(line, sizeof(line), "FLASH: %lu KB  SKETCH: %lu KB",
++                 static_cast<unsigned long>(ESP.getFlashChipSize() / 1024),
++                 static_cast<unsigned long>(ESP.getSketchSize() / 1024));
++        M5.Display.drawString(line, 5, 73);
++        snprintf(line, sizeof(line), "KBD  : %s", keyboardDriverLabel());
++        M5.Display.setTextColor(pal.primary, pal.background);
++        M5.Display.drawString(line, 5, 90);
++    } else {
++        snprintf(line, sizeof(line), "VER  : GHOST OS %s", kFirmwareVersion);
++        M5.Display.setTextColor(pal.primary, pal.background);
++        M5.Display.drawString(line, 5, 22);
++        M5.Display.setTextColor(pal.text, pal.background);
++        snprintf(line, sizeof(line), "STA  : %s", WiFi.macAddress().c_str());
++        M5.Display.drawString(line, 5, 39);
++        snprintf(line, sizeof(line), "THEME: %s", pal.name);
++        M5.Display.drawString(line, 5, 56);
++        M5.Display.drawString("REPO : github.com/PinoyUnknown", 5, 73);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString(kDeveloperTag, 5, 90);
++    }
++    drawFooter("W/S: PAGE 1/2  |  ESC: HOME");
++}
++
++void drawJsDiagnosticRunner()
+ {
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar("JS: AUTO DIAGNOSTIC MACRO");
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++    if (!selfTestRan) {
++        M5.Display.setTextColor(pal.primary, pal.background);
++        M5.Display.drawString("Built-in Hardware Diagnostic Macro", 5, 24);
++        M5.Display.setTextColor(pal.text, pal.background);
++        M5.Display.drawString("Runs Display, Keyboard, Battery,", 5, 44);
++        M5.Display.drawString("SPIFFS, Wi-Fi & IR verification", 5, 60);
++        M5.Display.drawString("and logs to /selftest.txt.", 5, 76);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString("Press ENTER or R to execute now", 5, 96);
++    } else {
++        M5.Display.setTextColor(selfTestPassed ? pal.primary : 0xF800, pal.background);
++        M5.Display.drawString(selfTestPassed ? "RESULT: ALL CHECKS PASSED" : "RESULT: CHECK WARNINGS",
++                              5, 20);
++        M5.Display.setTextColor(pal.text, pal.background);
++        for (uint8_t i = 0; i < 4; ++i) {
++            M5.Display.drawString(selfTestSummary[i], 5, 38 + i * 17);
++        }
++    }
++    drawFooter("ENTER/R: RUN SELF-TEST  ESC: HOME");
++}
++
++void drawPeripheralBusScreen()
++{
++    const ColorPalette &pal = activePalette();
++    char header[40];
++    snprintf(header, sizeof(header), "%s: GROVE & BUS INSPECTOR", themeImages[selectedApp].name);
++    drawHeaderBar(header);
++    M5.Display.setTextDatum(textdatum_t::top_left);
++    M5.Display.setTextColor(pal.primary, pal.background);
++
++    const char *expectedBus = "Grove HY2.0-4P (G2=SDA, G1=SCL)";
++    if (selectedApp == 11) {
++        expectedBus = "Grove UART (G1=RX, G2=TX @ 9600/115200)";
++    } else if (selectedApp == 5 || selectedApp == 6) {
++        expectedBus = "External SPI / Grove Radio Cap";
++    }
++    M5.Display.drawString(expectedBus, 5, 22);
++
++    M5.Display.setTextColor(pal.text, pal.background);
++    char line[52];
++    snprintf(line, sizeof(line), "Grove I2C devices detected: %u",
++             static_cast<unsigned>(detectedI2cCount));
++    M5.Display.drawString(line, 5, 42);
++
++    if (detectedI2cCount == 0) {
++        M5.Display.drawString("No external module on G2/G1", 5, 60);
++    } else {
++        String addrList = "ADDR: ";
++        for (size_t i = 0; i < detectedI2cCount; ++i) {
++            char hexBuf[8];
++            snprintf(hexBuf, sizeof(hexBuf), "0x%02X ", detectedI2cAddresses[i]);
++            addrList += hexBuf;
++        }
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString(addrList.substring(0, 38).c_str(), 5, 60);
++    }
++    M5.Display.setTextColor(pal.text, pal.background);
++    M5.Display.drawString("Connect module & press R to probe", 5, 84);
++    drawFooter("R: PROBE GROVE BUS  |  ESC: HOME");
++}
++
++void drawFileBrowser()
++{
++    const ColorPalette &pal = activePalette();
+     char heading[52];
+-    snprintf(heading, sizeof(heading), "FLASH:%s", currentDirectory.c_str());
+-    M5.Display.drawString(heading, 5, 4);
++    snprintf(heading, sizeof(heading), "FLASH:%s (%lu/%luKB)", currentDirectory.c_str(),
++             filesystemReady ? static_cast<unsigned long>(SPIFFS.usedBytes() / 1024) : 0UL,
++             filesystemReady ? static_cast<unsigned long>(SPIFFS.totalBytes() / 1024) : 0UL);
++    drawHeaderBar(heading);
++    M5.Display.setTextDatum(textdatum_t::top_left);
++    M5.Display.setTextColor(pal.primary, pal.background);
++
+     if (fileListingFailed) {
+         M5.Display.drawString("Flash filesystem unavailable", 5, 28);
+         return;
+@@ -680,25 +1380,27 @@ void drawFileBrowser()
+         const FileEntry &entry = fileEntries[index];
+         const int16_t y = 21 + static_cast<int16_t>(row) * 19;
+         if (index == selectedFile) {
+-            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, kAccentColor);
+-            M5.Display.setTextColor(kBackgroundColor, kAccentColor);
++            M5.Display.fillRect(2, y - 1, screenWidth - 4, 18, pal.accent);
++            M5.Display.setTextColor(pal.background, pal.accent);
+         } else {
+-            M5.Display.setTextColor(kThemeColor, kBackgroundColor);
++            M5.Display.setTextColor(pal.text, pal.background);
+         }
+         if (entry.isDirectory) {
+-            snprintf(heading, sizeof(heading), "[DIR] %.38s", entry.name);
++            snprintf(heading, sizeof(heading), "[DIR] %.32s", entry.name);
+         } else {
+-            snprintf(heading, sizeof(heading), "%.31s %luB", entry.name, static_cast<unsigned long>(entry.size));
++            snprintf(heading, sizeof(heading), "%.28s %luB", entry.name,
++                     static_cast<unsigned long>(entry.size));
+         }
+-        M5.Display.drawString(heading, 5, y);
++        M5.Display.drawString(heading, 5, y + 2);
+     }
+ }
+ 
+ void drawFilePreview()
+ {
++    const ColorPalette &pal = activePalette();
++    drawHeaderBar(previewPath.substring(previewPath.lastIndexOf('/') + 1).c_str());
+     M5.Display.setTextDatum(textdatum_t::top_left);
+-    M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+-    M5.Display.drawString(previewPath.substring(previewPath.lastIndexOf('/') + 1).c_str(), 5, 4);
++    M5.Display.setTextColor(pal.text, pal.background);
+     File file = SPIFFS.open(previewPath.c_str(), FILE_READ);
+     if (!file || file.isDirectory()) {
+         M5.Display.drawString("Unable to read file", 5, 27);
+@@ -717,44 +1419,48 @@ void drawFilePreview()
+ 
+ void drawFeature()
+ {
+-    if (selectedApp == 3) {
++    if (selectedApp == 0) {
++        drawConnectScreen();
++    } else if (selectedApp == 1) {
++        drawConfigScreen();
++    } else if (selectedApp == 2) {
++        drawClock();
++    } else if (selectedApp == 3) {
+         drawBluetoothSurvey();
+-        drawFooter("W/S: SELECT  ENTER: DETAILS  R: RESCAN");
++        drawFooter("W/S:MOVE ENTER:INFO R:SCAN L:SAVE");
+     } else if (selectedApp == 4) {
+         drawWifiSurvey();
+-        drawFooter("W/S: SELECT  ENTER: DETAILS  R: RESCAN");
+-    } else if (selectedApp == 2) {
+-        drawClock();
++        drawFooter("W/S:MOVE ENTER:INFO C:JOIN R:SCAN");
++    } else if (selectedApp == 8) {
++        drawMiscTelemetryScreen();
++    } else if (selectedApp == 9) {
++        drawJsDiagnosticRunner();
++    } else if (selectedApp == 10) {
++        drawIrDiagnosticScreen();
+     } else if (selectedApp == 13) {
+         drawFileBrowser();
+-        drawFooter("W/S: SELECT  ENTER: OPEN  ESC: BACK");
++        drawFooter("W/S:SELECT ENTER:OPEN ESC:BACK");
+     } else {
+-        M5.Display.setTextDatum(textdatum_t::top_left);
+-        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+-        M5.Display.drawString(themeImages[selectedApp].name, 5, 5);
+-        M5.Display.drawString(featureDetails[selectedApp], 5, 30);
+-        if (selectedApp == 5 || selectedApp == 6 || selectedApp == 7 || selectedApp == 10 ||
+-            selectedApp == 11 || selectedApp == 12) {
+-            M5.Display.drawString("Required external hardware is not", 5, 52);
+-            M5.Display.drawString("configured in this Cardputer build.", 5, 68);
+-        } else if (selectedApp == 8) {
+-            M5.Display.drawString("Available: passive Wi-Fi / BLE surveys,", 5, 52);
+-            M5.Display.drawString("UTC clock, and flash file browser.", 5, 68);
+-        }
+-        drawFooter("ESC / BACKSPACE: BACK");
++        drawPeripheralBusScreen();
+     }
+ }
+ 
+ void redrawScreen()
+ {
+-    M5.Display.fillScreen(kBackgroundColor);
++    const ColorPalette &pal = activePalette();
++    M5.Display.fillScreen(pal.background);
+     if (currentScreen == Screen::Home) {
+         drawHome();
+-    } else if (currentScreen == Screen::SurveyDetail) {
++        return;
++    }
++    drawBackdropOverlay();
++    if (currentScreen == Screen::SurveyDetail) {
+         drawSurveyDetail();
+     } else if (currentScreen == Screen::FilePreview) {
+         drawFilePreview();
+-        drawFooter("W/S: SCROLL  ESC: FILES");
++        drawFooter("W/S: SCROLL  |  ESC: FILES");
++    } else if (currentScreen == Screen::WifiPasswordEntry) {
++        drawWifiPasswordPrompt();
+     } else {
+         drawFeature();
+     }
+@@ -788,14 +1494,52 @@ void openSelectedApp()
+         scanNearbyBluetoothDevices();
+     } else if (selectedApp == 4) {
+         scanNearbyAccessPoints();
++    } else if (selectedApp == 5 || selectedApp == 6 || selectedApp == 7 || selectedApp == 11 ||
++               selectedApp == 12) {
++        scanGroveI2cBus();
+     } else if (selectedApp == 13) {
+         currentDirectory = "/";
+         loadFileList();
+     }
+ }
+ 
++void handleConfigAction()
++{
++    if (selectedConfigRow == 0) {
++        paletteIndex = static_cast<uint8_t>((paletteIndex + 1) % kPalettes.size());
++    } else if (selectedConfigRow == 1) {
++        backdropMode = static_cast<uint8_t>((backdropMode + 1) % 3);
++    } else if (selectedConfigRow == 2) {
++        brightnessStep = static_cast<uint8_t>((brightnessStep + 1) % 4);
++    } else if (selectedConfigRow == 3) {
++        keyBeepEnabled = !keyBeepEnabled;
++    } else if (selectedConfigRow == 4) {
++        paletteIndex = 0;
++        backdropMode = 1;
++        brightnessStep = 3;
++        keyBeepEnabled = true;
++        setStatusBanner("Defaults restored");
++    }
++    saveSettings();
++}
++
+ void handleFeatureKey(uint8_t key)
+ {
++    if (currentScreen == Screen::WifiPasswordEntry) {
++        if (key == kKeyEscape) {
++            currentScreen = Screen::Feature;
++        } else if (key == kKeyBackspace && !wifiPasswordInput.isEmpty()) {
++            wifiPasswordInput.remove(wifiPasswordInput.length() - 1);
++        } else if (key == kKeySelect || key == '\n') {
++            currentScreen = Screen::Feature;
++            selectedApp = 0;
++            connectToSelectedWifi();
++        } else if (key >= 32 && key <= 126 && wifiPasswordInput.length() < 63) {
++            wifiPasswordInput += static_cast<char>(key);
++        }
++        return;
++    }
++
+     if (manualTimeEntry) {
+         if (key == kKeyEscape) {
+             manualTimeEntry = false;
+@@ -811,6 +1555,18 @@ void handleFeatureKey(uint8_t key)
+     }
+ 
+     if (currentScreen == Screen::SurveyDetail) {
++        if (selectedApp == 4 && (key == 'c' || key == 'C') && selectedResult < accessPointCount) {
++            wifiTargetSsid = accessPoints[selectedResult].ssid;
++            wifiPasswordInput = "";
++            if (accessPoints[selectedResult].security == WIFI_AUTH_OPEN) {
++                currentScreen = Screen::Feature;
++                selectedApp = 0;
++                connectToSelectedWifi();
++            } else {
++                currentScreen = Screen::WifiPasswordEntry;
++            }
++            return;
++        }
+         if (key == kKeyEscape || key == kKeyBackspace) {
+             currentScreen = Screen::Feature;
+         }
+@@ -818,7 +1574,7 @@ void handleFeatureKey(uint8_t key)
+     }
+ 
+     if (currentScreen == Screen::FilePreview) {
+-        if (key == kKeyDown || key == 's') {
++        if (key == kKeyDown || key == 's' || key == 'S') {
+             File file = SPIFFS.open(previewPath.c_str(), FILE_READ);
+             size_t lineCount = 0;
+             while (file && file.available()) {
+@@ -828,7 +1584,7 @@ void handleFeatureKey(uint8_t key)
+             if (lineCount > previewLineOffset + kVisibleResults) {
+                 ++previewLineOffset;
+             }
+-        } else if ((key == kKeyUp || key == 'w') && previewLineOffset > 0) {
++        } else if ((key == kKeyUp || key == 'w' || key == 'W') && previewLineOffset > 0) {
+             --previewLineOffset;
+         } else if (key == kKeyEscape || key == kKeyBackspace) {
+             currentScreen = Screen::Feature;
+@@ -836,28 +1592,98 @@ void handleFeatureKey(uint8_t key)
+         return;
+     }
+ 
+-    if (selectedApp == 3 || selectedApp == 4) {
++    if (selectedApp == 0) {
++        if (key == 's' || key == 'S' || key == kKeySelect || key == '\n') {
++            selectedApp = 4;
++            selectedResult = 0;
++            scanNearbyAccessPoints();
++            return;
++        } else if (key == 't' || key == 'T') {
++            runNetworkConnectivityTest();
++            return;
++        } else if (key == 'd' || key == 'D') {
++            WiFi.disconnect(false, false);
++            connectStatusMessage = "Disconnected";
++            setStatusBanner("Wi-Fi disconnected");
++            return;
++        }
++    } else if (selectedApp == 1) {
++        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedConfigRow > 0) {
++            --selectedConfigRow;
++            return;
++        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedConfigRow < 4) {
++            ++selectedConfigRow;
++            return;
++        } else if (key == kKeySelect || key == '\n' || key == kKeyRight || key == kKeyLeft) {
++            handleConfigAction();
++            return;
++        }
++    } else if (selectedApp == 2) {
++        if (key == 'n' || key == 'N') {
++            syncClockFromNetwork();
++            return;
++        } else if (key == 'm' || key == 'M') {
++            beginManualTimeEntry();
++            return;
++        }
++    } else if (selectedApp == 3 || selectedApp == 4) {
+         const size_t resultCount = selectedApp == 3 ? bluetoothDeviceCount : accessPointCount;
+-        if ((key == kKeyUp || key == 'w') && selectedResult > 0) {
++        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedResult > 0) {
+             --selectedResult;
+-        } else if ((key == kKeyDown || key == 's') && selectedResult + 1 < resultCount) {
++        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedResult + 1 < resultCount) {
+             ++selectedResult;
+         } else if (key == 'r' || key == 'R') {
+             selectedResult = 0;
+             selectedApp == 3 ? scanNearbyBluetoothDevices() : scanNearbyAccessPoints();
++        } else if (key == 'l' || key == 'L') {
++            selectedApp == 3 ? saveBleSurveyLog() : saveWifiSurveyLog();
++        } else if (selectedApp == 4 && (key == 'c' || key == 'C') && selectedResult < accessPointCount) {
++            wifiTargetSsid = accessPoints[selectedResult].ssid;
++            wifiPasswordInput = "";
++            if (accessPoints[selectedResult].security == WIFI_AUTH_OPEN) {
++                selectedApp = 0;
++                connectToSelectedWifi();
++            } else {
++                currentScreen = Screen::WifiPasswordEntry;
++            }
++            return;
+         } else if ((key == kKeySelect || key == '\n') && resultCount > 0) {
+             currentScreen = Screen::SurveyDetail;
+         }
+-    } else if (selectedApp == 2) {
+-        if (key == 'n' || key == 'N') {
+-            syncClockFromNetwork();
+-        } else if (key == 'm' || key == 'M') {
+-            beginManualTimeEntry();
++    } else if (selectedApp == 5 || selectedApp == 6 || selectedApp == 7 || selectedApp == 11 ||
++               selectedApp == 12) {
++        if (key == 'r' || key == 'R' || key == kKeySelect || key == '\n') {
++            scanGroveI2cBus();
++            setStatusBanner("Grove bus rescanned");
++            return;
++        }
++    } else if (selectedApp == 8) {
++        if (key == kKeyUp || key == kKeyDown || key == 'w' || key == 'W' || key == 's' || key == 'S' ||
++            key == kKeyLeft || key == kKeyRight) {
++            miscPage ^= 1;
++            return;
++        }
++    } else if (selectedApp == 9) {
++        if (key == kKeySelect || key == '\n' || key == 'r' || key == 'R') {
++            runHardwareSelfTest();
++            return;
++        }
++    } else if (selectedApp == 10) {
++        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedIrIndex > 0) {
++            --selectedIrIndex;
++            return;
++        } else if ((key == kKeyDown || key == 's' || key == 'S') &&
++                   selectedIrIndex + 1 < kIrCommands.size()) {
++            ++selectedIrIndex;
++            return;
++        } else if (key == kKeySelect || key == '\n') {
++            transmitIrCommand(kIrCommands[selectedIrIndex]);
++            return;
+         }
+     } else if (selectedApp == 13) {
+-        if ((key == kKeyUp || key == 'w') && selectedFile > 0) {
++        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedFile > 0) {
+             --selectedFile;
+-        } else if ((key == kKeyDown || key == 's') && selectedFile + 1 < fileEntryCount) {
++        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedFile + 1 < fileEntryCount) {
+             ++selectedFile;
+         } else if (key == kKeySelect || key == '\n') {
+             openSelectedFile();
+@@ -880,10 +1706,14 @@ void handleFeatureKey(uint8_t key)
+ 
+ void handleKey(uint8_t key)
+ {
++    if (keyBeepEnabled) {
++        M5.Speaker.tone(2400, 12);
++    }
+     if (currentScreen == Screen::Home) {
+-        if (key == kKeyUp || key == 'w' || key == kKeyLeft) {
++        if (key == kKeyUp || key == 'w' || key == 'W' || key == kKeyLeft || key == 'a' || key == 'A') {
+             selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
+-        } else if (key == kKeyDown || key == 's' || key == kKeyRight) {
++        } else if (key == kKeyDown || key == 's' || key == 'S' || key == kKeyRight || key == 'd' ||
++                   key == 'D') {
+             selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
+         } else if (key == kKeySelect || key == '\n' || key == ' ') {
+             openSelectedApp();
+@@ -894,23 +1724,16 @@ void handleKey(uint8_t key)
+     redrawScreen();
+ }
+ 
+-void pollKeyboard()
++void pollTca8418Keyboard()
+ {
+-    if (!keyboardReady) {
+-        return;
+-    }
+     const int count = readKeyboardRegister(kKeyEventCountRegister);
+-    if (count < 0) {
+-        keyboardReady = false;
+-        redrawScreen();
++    if (count <= 0) {
+         return;
+     }
+ 
+     for (int i = 0; i < std::min(count & 0x0F, static_cast<int>(kMaxKeysPerRead)); ++i) {
+-        const int event = readKeyboardRegister(kKeyEventRegister + i);
++        const int event = readKeyboardRegister(kKeyEventRegister);
+         if (event < 0) {
+-            keyboardReady = false;
+-            redrawScreen();
+             return;
+         }
+         const uint8_t keyNumber = static_cast<uint8_t>(event & 0x7F);
+@@ -924,59 +1747,148 @@ void pollKeyboard()
+         }
+ 
+         const uint8_t keyIndex = static_cast<uint8_t>(row * kKeyboardColumns + column);
+-        if ((event & 0x80) != 0) {
+-            if (keyIndex == kKeyFunction) {
+-                keyboardModifiers ^= 0x02;
+-            } else if (keyIndex == kKeyShift) {
+-                keyboardModifiers ^= 0x01;
++        const bool pressed = (event & 0x80) != 0;
++
++        if (keyIndex == kKeyFunction) {
++            if (pressed) {
++                heldModifiers |= 0x02;
++                stickyModifiers ^= 0x02;
++            } else {
++                heldModifiers &= ~0x02;
++            }
++            continue;
++        }
++        if (keyIndex == kKeyShift) {
++            if (pressed) {
++                heldModifiers |= 0x01;
++                stickyModifiers ^= 0x01;
++            } else {
++                heldModifiers &= ~0x01;
++            }
++            continue;
++        }
++
++        if (pressed) {
++            const uint8_t key = translateKeyIndex(keyIndex, heldModifiers | stickyModifiers);
++            stickyModifiers = 0;
++            if (key != 0) {
++                handleKey(key);
+             }
++        }
++    }
++}
++
++void pollGpioMatrixKeyboard()
++{
++    if (millis() - lastKeyScanMs < 18) {
++        return;
++    }
++    lastKeyScanMs = millis();
++
++    std::array<bool, kTotalKeys> currentStates{};
++    for (uint8_t i = 0; i < 8; ++i) {
++        setMatrixOutput(i);
++        delayMicroseconds(10);
++        const uint8_t inputMask = readMatrixInputs();
++        if (inputMask == 0) {
+             continue;
+         }
++        for (uint8_t j = 0; j < 7; ++j) {
++            if ((inputMask & (1U << j)) == 0) {
++                continue;
++            }
++            const uint8_t x = (i > 3) ? static_cast<uint8_t>(2U * j) : static_cast<uint8_t>(2U * j + 1U);
++            const uint8_t rawY = (i > 3) ? static_cast<uint8_t>(i - 4U) : i;
++            const uint8_t y = static_cast<uint8_t>(3U - rawY);
++            const uint8_t keyIndex = static_cast<uint8_t>(x * 4U + y);
++            if (keyIndex < kTotalKeys) {
++                currentStates[keyIndex] = true;
++            }
++        }
++    }
++
++    heldModifiers = 0;
++    if (currentStates[kKeyFunction]) {
++        heldModifiers |= 0x02;
++    }
++    if (currentStates[kKeyShift]) {
++        heldModifiers |= 0x01;
++    }
++
++    if (currentStates[kKeyFunction] && !previousKeyStates[kKeyFunction]) {
++        stickyModifiers ^= 0x02;
++    }
++    if (currentStates[kKeyShift] && !previousKeyStates[kKeyShift]) {
++        stickyModifiers ^= 0x01;
++    }
++
++    for (uint8_t keyIndex = 0; keyIndex < kTotalKeys; ++keyIndex) {
+         if (keyIndex == kKeyFunction || keyIndex == kKeyShift) {
+             continue;
+         }
+-        const uint8_t key = kKeyMap[keyIndex][keyboardModifiers & 0x03];
+-        if (key != 0) {
+-            handleKey(key);
++        if (currentStates[keyIndex] && !previousKeyStates[keyIndex]) {
++            const uint8_t key = translateKeyIndex(keyIndex, heldModifiers | stickyModifiers);
++            stickyModifiers = 0;
++            if (key != 0) {
++                previousKeyStates = currentStates;
++                handleKey(key);
++                return;
++            }
+         }
+-        keyboardModifiers = 0;
++    }
++
++    previousKeyStates = currentStates;
++}
++
++void pollKeyboard()
++{
++    if (keyboardDriver == KeyboardDriver::Tca8418I2c) {
++        pollTca8418Keyboard();
++    } else if (keyboardDriver == KeyboardDriver::GpioMatrix74HC138) {
++        pollGpioMatrixKeyboard();
+     }
+ }
+ 
+ void showBootSplash()
+ {
++    const ColorPalette &pal = activePalette();
+     constexpr uint8_t frames = 24;
+     for (uint8_t frame = 0; frame < frames; ++frame) {
+         const float progress = static_cast<float>(frame) / (frames - 1);
+         const float pulse = 1.0F + 0.12F * std::sin(progress * 2.0F * 3.14159F);
+-        const int16_t size = static_cast<int16_t>(48.0F * pulse);
++        const int16_t size = static_cast<int16_t>(46.0F * pulse);
+         const int16_t centerX = screenWidth / 2;
+-        const int16_t centerY = static_cast<int16_t>(36 + (1.0F - progress) * 10.0F);
++        const int16_t centerY = static_cast<int16_t>(34 + (1.0F - progress) * 8.0F);
+         const int16_t bodyHeight = size * 3 / 4;
+         const int16_t left = centerX - size / 2;
+         const int16_t top = centerY - size / 2;
+ 
+-        M5.Display.fillScreen(kBackgroundColor);
+-        M5.Display.drawFastHLine(0, 8, static_cast<int32_t>(screenWidth * progress), kAccentColor);
+-        M5.Display.drawRect(8, 8, screenWidth - 16, screenHeight - 16, kThemeColor);
+-        M5.Display.fillCircle(centerX, top + size / 3, size / 3, kThemeColor);
+-        M5.Display.fillRect(left + size / 6, top + size / 3, size * 2 / 3, bodyHeight / 2, kThemeColor);
+-        M5.Display.fillTriangle(left + size / 6, top + bodyHeight * 5 / 6, centerX, top + bodyHeight * 5 / 6,
+-                                left + size / 3, top + bodyHeight, kThemeColor);
+-        M5.Display.fillTriangle(centerX, top + bodyHeight * 5 / 6, left + size * 5 / 6, top + bodyHeight * 5 / 6,
+-                                left + size * 2 / 3, top + bodyHeight, kThemeColor);
+-        M5.Display.fillCircle(centerX - size / 6, top + size / 3, std::max<int16_t>(2, size / 12), kAccentColor);
+-        M5.Display.fillCircle(centerX + size / 6, top + size / 3, std::max<int16_t>(2, size / 12), kAccentColor);
++        M5.Display.fillScreen(pal.background);
++        M5.Display.drawFastHLine(0, 6, static_cast<int32_t>(screenWidth * progress), pal.accent);
++        M5.Display.drawRect(6, 6, screenWidth - 12, screenHeight - 12, pal.primary);
++        M5.Display.fillCircle(centerX, top + size / 3, size / 3, pal.primary);
++        M5.Display.fillRect(left + size / 6, top + size / 3, size * 2 / 3, bodyHeight / 2, pal.primary);
++        M5.Display.fillTriangle(left + size / 6, top + bodyHeight * 5 / 6, centerX,
++                                top + bodyHeight * 5 / 6, left + size / 3, top + bodyHeight, pal.primary);
++        M5.Display.fillTriangle(centerX, top + bodyHeight * 5 / 6, left + size * 5 / 6,
++                                top + bodyHeight * 5 / 6, left + size * 2 / 3, top + bodyHeight,
++                                pal.primary);
++        M5.Display.fillCircle(centerX - size / 6, top + size / 3, std::max<int16_t>(2, size / 12),
++                              pal.accent);
++        M5.Display.fillCircle(centerX + size / 6, top + size / 3, std::max<int16_t>(2, size / 12),
++                              pal.accent);
+ 
+         M5.Display.setTextDatum(textdatum_t::middle_center);
+         M5.Display.setTextSize(2);
+-        M5.Display.setTextColor(kAccentColor, kBackgroundColor);
+-        M5.Display.drawString("GHOST", centerX, 85);
++        M5.Display.setTextColor(pal.accent, pal.background);
++        M5.Display.drawString("GHOST OS", centerX, 82);
+         M5.Display.setTextSize(1);
+-        M5.Display.setTextColor(kThemeColor, kBackgroundColor);
+-        M5.Display.drawString("PinoyUnknown", centerX, 104);
+-        M5.Display.drawFastHLine(0, screenHeight - 9,
+-                                 static_cast<int32_t>(screenWidth * (1.0F - progress)), kAccentColor);
++        M5.Display.setTextColor(pal.primary, pal.background);
++        M5.Display.drawString("PinoyUnknown | v1.2.0", centerX, 100);
++        M5.Display.setTextColor(pal.text, pal.background);
++        M5.Display.drawString("www.instagram.com/pinoyunknown", centerX, 114);
++        M5.Display.drawFastHLine(0, screenHeight - 7,
++                                 static_cast<int32_t>(screenWidth * (1.0F - progress)), pal.accent);
+         delay(24);
+     }
+ }
+@@ -989,7 +1901,12 @@ void setup()
+     M5.begin(config);
+     screenWidth = M5.Display.width();
+     screenHeight = M5.Display.height();
+-    keyboardReady = initializeKeyboard();
++    pinMode(kCardputerIrPin, OUTPUT);
++    digitalWrite(kCardputerIrPin, LOW);
++    loadSettings();
++    initBackdropAnimation();
++    ensureFilesystemReady();
++    initializeKeyboard();
+     showBootSplash();
+     redrawScreen();
+ }
+@@ -998,20 +1915,32 @@ void loop()
+ {
+     M5.update();
+     pollKeyboard();
+-    if (M5.BtnA.wasPressed()) {
++
++    // Non-blocking BtnA (G0) support: short press opens/selects, long press (>500ms) acts as ESC/Cycle
++    if (M5.BtnA.pressedFor(500) && !btnAHandledLong) {
++        btnAHandledLong = true;
+         if (currentScreen == Screen::Home) {
+-            openSelectedApp();
++            selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
++            redrawScreen();
+         } else {
+-            handleFeatureKey(kKeySelect);
++            handleKey(kKeyEscape);
+         }
+-        redrawScreen();
++    } else if (M5.BtnA.wasReleased()) {
++        if (!btnAHandledLong) {
++            handleKey(kKeySelect);
++        }
++        btnAHandledLong = false;
+     }
++
+     if (currentScreen == Screen::Feature && selectedApp == 2 && !manualTimeEntry) {
+         const time_t currentSecond = time(nullptr);
+         if (currentSecond != clockDisplaySecond) {
+             clockDisplaySecond = currentSecond;
+             redrawScreen();
+         }
++    } else if (currentScreen != Screen::Home && backdropMode != 0 && millis() - lastBackdropMs >= 180) {
++        lastBackdropMs = millis();
++        redrawScreen();
+     }
+-    delay(10);
++    delay(8);
+ }
