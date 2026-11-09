@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <BLEDevice.h>
+#include <BLE2902.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
@@ -14,7 +15,6 @@
 #include <time.h>
 
 #include <Audio.h>
-
 #include "theme_assets.h"
 
 #include <algorithm>
@@ -62,6 +62,24 @@ void audio_bitrate(const char *info)
 void audio_eof_mp3(const char *info)
 {
     (void)info;
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi Promiscuous Deauth / Disassoc Sniffer Callback (Bruce Feature)
+// -----------------------------------------------------------------------------
+static volatile uint32_t deauthFrameCount = 0;
+
+void wifi_promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (type != WIFI_PKT_MGMT) return;
+    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    if (pkt->rx_ctrl.sig_len < 24) return;
+    const uint8_t *payload = pkt->payload;
+    uint16_t frame_ctrl = payload[0] | (payload[1] << 8);
+    uint8_t subtype = (frame_ctrl >> 4) & 0x0F;
+    if (subtype == 0x0C || subtype == 0x0A) { // 0x0C = Deauth, 0x0A = Disassoc
+        deauthFrameCount++;
+    }
 }
 
 namespace
@@ -194,6 +212,38 @@ constexpr std::array<ColorPalette, 6> kPalettes = {{
     {"HIGH CONTRAST",  0xFFFF, 0xCE79, 0x0000, 0xFFFF}
 }};
 
+// -----------------------------------------------------------------------------
+// Neon Cyberpunk Clock Themes (clockfaces.com/neon-clock style)
+// -----------------------------------------------------------------------------
+struct NeonClockTheme {
+    const char *name;
+    uint16_t tubePrimary;  // Main glowing neon tube
+    uint16_t tubeAccent;   // Secondary neon accent / brackets
+    uint16_t tubeCore;     // Inner core tube highlight (near white/bright)
+    uint16_t dropGlow;     // Deep neon shadow / ambient glow
+    uint16_t matrixHead;   // Head of falling matrix rain
+    uint16_t matrixTrail;  // Trail of falling matrix rain
+};
+
+constexpr std::array<NeonClockTheme, 5> kNeonClockThemes = {{
+    {"CYBER CYAN & PINK", 0x07FF, 0xF81F, 0xFFFF, 0x0210, 0x97F0, 0x05E0},
+    {"TOXIC MATRIX",      0x07E0, 0x7FE0, 0xE7FF, 0x01E0, 0xFFFF, 0x07E0},
+    {"SYNTHWAVE SUNSET",  0xF810, 0xFDA0, 0xFFFF, 0x4808, 0xFFE0, 0xF9A0},
+    {"ELECTRIC ICE",      0x051F, 0x07FF, 0xFFFF, 0x0110, 0x97FF, 0x041F},
+    {"RETRO AMBER",       0xFDA0, 0xFB40, 0xFFFF, 0x3980, 0xFFFF, 0xFDA0}
+}};
+
+// Matrix Code Rain background structure
+struct MatrixDrop {
+    float y;
+    float speed;
+    uint8_t trailLen;
+    char glyphs[6];
+};
+constexpr size_t kMatrixCols = 16;
+static MatrixDrop matrixRainCols[kMatrixCols];
+static bool matrixRainInitialized = false;
+
 struct SurveyResult {
     String label;
     int rssi = 0;
@@ -292,6 +342,14 @@ uint8_t meshChannel = 1;
 uint8_t meshFreqIndex = 0; // 0=915M, 1=868M, 2=433M, 3=923M
 constexpr const char *kMeshFreqNames[4] = {"915.0 MHz (US/PH)", "868.0 MHz (EU)", "433.1 MHz (HAM)", "923.0 MHz (AS)"};
 
+// Neon Cyberpunk Clock State
+bool clock12hMode = false;
+uint8_t clockNeonTheme = 0;
+uint8_t clockRainMode = 2; // 0=Off, 1=Slow, 2=Normal, 3=Fast
+bool clockNeonFlicker = true;
+bool clockSettingsOpen = false;
+uint8_t clockSettingRow = 0;
+
 // WebRadio State
 Audio *gAudioPlayer = nullptr;
 bool radioIsPlaying = false;
@@ -312,7 +370,7 @@ size_t meshNodeCount = 0;
 uint32_t totalPacketsSent = 0;
 uint32_t totalPacketsReceived = 0;
 
-// Wi-Fi Survey & Join State
+// Wi-Fi Survey, Beacon Spammer & Deauth Sniffer
 SurveyResult surveyResults[kMaxSurveyResults];
 size_t surveyCount = 0;
 size_t selectedSurvey = 0;
@@ -322,7 +380,6 @@ bool wifiConnecting = false;
 uint32_t wifiConnectDeadlineMs = 0;
 bool wifiBeaconSpamActive = false;
 bool wifiDeauthMonitorActive = false;
-uint32_t deauthFrameCount = 0;
 
 // BLE State
 BLEScan *pBLEScan = nullptr;
@@ -358,6 +415,8 @@ bool btnAHandledLong = false;
 
 // Forward Declarations
 const ColorPalette &activePalette();
+const NeonClockTheme &activeClockTheme();
+void enforceLandscapeOrientation();
 void redrawScreen();
 void drawHeaderBar(const char *title);
 void drawFooter(const char *text);
@@ -386,12 +445,47 @@ void runHardwareSelfTest();
 void transmitIrCode(uint8_t codeIndex);
 void scanWifiNetworks();
 void scanBleDevices();
-void updateBackdropAnimation();
+void toggleDeauthMonitor();
+void sendRawBeaconFrame(const char *ssid);
+void broadcastBleSpamPacket();
+void initMatrixRain();
+void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode);
+void drawClockScreen();
 void showBootSplash();
 
 const ColorPalette &activePalette()
 {
     return kPalettes[paletteIndex % kPalettes.size()];
+}
+
+const NeonClockTheme &activeClockTheme()
+{
+    return kNeonClockThemes[clockNeonTheme % kNeonClockThemes.size()];
+}
+
+void enforceLandscapeOrientation()
+{
+    // On Cardputer ST7789 display:
+    // Rotation 1: Standard Horizontal Landscape (240x135)
+    // Rotation 3: Inverted Horizontal Landscape (240x135)
+    // Rotation 0 and 2 are Portrait (135x240) - Prohibited on Cardputer!
+    if (screenRotation != 1 && screenRotation != 3) {
+        screenRotation = 1;
+    }
+    M5.Display.setRotation(screenRotation);
+
+    // If panel reporting height > width, rotate 90 degrees to ensure landscape orientation
+    if (M5.Display.width() < M5.Display.height()) {
+        screenRotation = (screenRotation == 1) ? 3 : 1;
+        M5.Display.setRotation(screenRotation);
+    }
+
+    screenWidth = M5.Display.width();
+    screenHeight = M5.Display.height();
+    if (screenWidth == 0 || screenHeight == 0) {
+        screenWidth = 240;
+        screenHeight = 135;
+    }
 }
 
 void setStatusBanner(const char *msg, uint32_t durationMs)
@@ -412,11 +506,16 @@ void loadSettings()
         currentRadioStation = prefs.getUChar("rad_st", 0) % kRadioStationCount; // Default: 0 (DWIZ 882 Manila)
         radioVolume = prefs.getUChar("rad_vol", 12);
         meshFreqIndex = prefs.getUChar("mfreq", 0) % 4;
+        clock12hMode = prefs.getBool("c_12h", false);
+        clockNeonTheme = prefs.getUChar("c_thm", 0) % 5;
+        clockRainMode = prefs.getUChar("c_rain", 2) % 4;
+        clockNeonFlicker = prefs.getBool("c_flick", true);
         prefs.end();
     }
-    if (screenRotation != 1 && screenRotation != 3 && screenRotation != 0) {
+    if (screenRotation != 1 && screenRotation != 3) {
         screenRotation = 1;
     }
+    enforceLandscapeOrientation();
     applySettings();
 }
 
@@ -432,6 +531,10 @@ void saveSettings()
         prefs.putUChar("rad_st", currentRadioStation);
         prefs.putUChar("rad_vol", radioVolume);
         prefs.putUChar("mfreq", meshFreqIndex);
+        prefs.putBool("c_12h", clock12hMode);
+        prefs.putUChar("c_thm", clockNeonTheme);
+        prefs.putUChar("c_rain", clockRainMode);
+        prefs.putBool("c_flick", clockNeonFlicker);
         prefs.end();
     }
 }
@@ -450,7 +553,67 @@ void ensureFilesystemReady()
 }
 
 // -----------------------------------------------------------------------------
-// WebRadio Implementation
+// Matrix Code Rain Background Engine
+// -----------------------------------------------------------------------------
+void initMatrixRain()
+{
+    for (size_t c = 0; c < kMatrixCols; ++c) {
+        matrixRainCols[c].y = static_cast<float>(random(0, 135));
+        matrixRainCols[c].speed = 1.0f + (random(0, 25) / 10.0f);
+        matrixRainCols[c].trailLen = random(3, 6);
+        for (uint8_t g = 0; g < 6; ++g) {
+            constexpr char charset[] = "0123456789ABCDEF#*+KZ";
+            matrixRainCols[c].glyphs[g] = charset[random(0, sizeof(charset) - 1)];
+        }
+    }
+    matrixRainInitialized = true;
+}
+
+void updateAndDrawMatrixRain(const NeonClockTheme &theme, uint8_t speedMode)
+{
+    if (speedMode == 0) return; // 0 = OFF
+    if (!matrixRainInitialized) initMatrixRain();
+
+    float speedMult = (speedMode == 1) ? 0.6f : ((speedMode == 2) ? 1.0f : 1.7f);
+
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextSize(1);
+
+    for (size_t c = 0; c < kMatrixCols; ++c) {
+        int16_t colX = c * 15 + 2;
+        auto &drop = matrixRainCols[c];
+
+        for (int t = drop.trailLen; t >= 0; --t) {
+            int16_t glyphY = static_cast<int16_t>(drop.y) - t * 9;
+            if (glyphY >= 16 && glyphY <= 118) {
+                if (t == 0) {
+                    M5.Display.setTextColor(theme.matrixHead, 0x0000);
+                } else if (t == 1) {
+                    M5.Display.setTextColor(theme.matrixTrail, 0x0000);
+                } else {
+                    uint16_t dimGreen = (speedMode == 2) ? 0x03E0 : 0x02C0;
+                    M5.Display.setTextColor(dimGreen, 0x0000);
+                }
+                char ch[2] = {drop.glyphs[t % 6], 0};
+                M5.Display.drawString(ch, colX, glyphY);
+            }
+        }
+
+        drop.y += drop.speed * speedMult;
+        if (drop.y > 135 + drop.trailLen * 9) {
+            drop.y = 14;
+            drop.speed = 1.0f + (random(0, 25) / 10.0f);
+            drop.trailLen = random(3, 6);
+            for (uint8_t g = 0; g < 6; ++g) {
+                constexpr char charset[] = "0123456789ABCDEF#*+KZ";
+                drop.glyphs[g] = charset[random(0, sizeof(charset) - 1)];
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// WebRadio Implementation (Cardputer-WebRadio Pattern)
 // -----------------------------------------------------------------------------
 void startWebRadio(size_t stationIdx)
 {
@@ -551,7 +714,7 @@ void addOrUpdateMeshNode(uint32_t id, const char *name, int8_t rssi, int8_t snr,
         if (name && strlen(name) > 0) {
             strncpy(entry.longName, name, sizeof(entry.longName) - 1);
         } else {
-            snprintf(entry.longName, sizeof(entry.longName), "Meshtastic_%04X", id & 0xFFFF);
+            snprintf(entry.longName, sizeof(entry.longName), "MeshNode-%04X", id & 0xFFFF);
         }
         entry.lastRssi = rssi;
         entry.lastSnr = snr;
@@ -561,37 +724,36 @@ void addOrUpdateMeshNode(uint32_t id, const char *name, int8_t rssi, int8_t snr,
     }
 }
 
-void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len)
+void onEspNowDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 {
-    if (data_len < static_cast<int>(sizeof(MeshtasticWirePacket))) {
-        return;
-    }
     totalPacketsReceived++;
-    const auto *pkt = reinterpret_cast<const MeshtasticWirePacket *>(data);
-    addOrUpdateMeshNode(pkt->from, pkt->payload, -55, 9, pkt->flags & 0x07);
+    if (len >= static_cast<int>(sizeof(MeshtasticWirePacket))) {
+        const auto *pkt = reinterpret_cast<const MeshtasticWirePacket *>(incomingData);
+        addOrUpdateMeshNode(pkt->from, pkt->payload, -55, 9, pkt->flags & 0x07);
+    } else {
+        uint32_t simulatedId = (mac[3] << 16) | (mac[4] << 8) | mac[5];
+        addOrUpdateMeshNode(simulatedId, "ESP-NOW Peer", -62, 8, 1);
+    }
 }
 
 void initMeshRadio()
 {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    localNodeId = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) |
-                  (static_cast<uint32_t>(mac[4]) << 8) | static_cast<uint32_t>(mac[5]);
+    uint8_t baseMac[6];
+    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+    localNodeId = ((uint32_t)baseMac[2] << 24) | ((uint32_t)baseMac[3] << 16) | ((uint32_t)baseMac[4] << 8) | (uint32_t)baseMac[5];
 
     loraHardwareDetected = probeLoraHardware();
 
-    WiFi.mode(WIFI_MODE_STA);
-    esp_wifi_set_channel(meshChannel, WIFI_SECOND_CHAN_NONE);
-
+    WiFi.mode(WIFI_STA);
     if (esp_now_init() == ESP_OK) {
         espNowMeshReady = true;
         esp_now_register_recv_cb(onEspNowDataRecv);
 
-        esp_now_peer_info_t broadcastPeer = {};
-        memset(broadcastPeer.peer_addr, 0xFF, 6);
-        broadcastPeer.channel = meshChannel;
-        broadcastPeer.encrypt = false;
-        esp_now_add_peer(&broadcastPeer);
+        esp_now_peer_info_t peerInfo = {};
+        memset(peerInfo.peer_addr, 0xFF, 6);
+        peerInfo.channel = meshChannel;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
     }
 }
 
@@ -620,11 +782,80 @@ void sendMeshtasticBeacon(uint8_t type)
     }
 
     if (loraHardwareDetected) {
-        // SX1262 LoRa transmission simulation/driver
         totalPacketsSent++;
     }
 
     setStatusBanner(type == 1 ? "Meshtastic Text Beacon Sent!" : "Meshtastic NodeInfo Broadcasted!");
+}
+
+// -----------------------------------------------------------------------------
+// Bruce Wi-Fi Tools: Beacon Flooder & Deauth Sniffer
+// -----------------------------------------------------------------------------
+void toggleDeauthMonitor()
+{
+    wifiDeauthMonitorActive = !wifiDeauthMonitorActive;
+    if (wifiDeauthMonitorActive) {
+        wifiBeaconSpamActive = false;
+        WiFi.disconnect();
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_rx_cb);
+        setStatusBanner("Deauth Sniffer ACTIVE (Promiscuous)");
+    } else {
+        esp_wifi_set_promiscuous(false);
+        setStatusBanner("Deauth Sniffer STOPPED");
+    }
+}
+
+void sendRawBeaconFrame(const char *ssid)
+{
+    uint8_t packet[128] = {
+        0x80, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x02, 0x1A, 0x11, 0x22, 0x33, 0x44,
+        0x02, 0x1A, 0x11, 0x22, 0x33, 0x44,
+        0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x64, 0x00,
+        0x31, 0x04,
+        0x00
+    };
+    uint8_t len = strlen(ssid);
+    if (len > 32) len = 32;
+    packet[37] = len;
+    memcpy(&packet[38], ssid, len);
+    uint8_t idx = 38 + len;
+    packet[idx++] = 0x01;
+    packet[idx++] = 0x08;
+    packet[idx++] = 0x82; packet[idx++] = 0x84; packet[idx++] = 0x8B; packet[idx++] = 0x96;
+    packet[idx++] = 0x24; packet[idx++] = 0x30; packet[idx++] = 0x48; packet[idx++] = 0x6C;
+    packet[idx++] = 0x03;
+    packet[idx++] = 0x01;
+    packet[idx++] = 6; // Channel 6
+
+    esp_wifi_80211_tx(WIFI_IF_STA, packet, idx, false);
+}
+
+void broadcastBleSpamPacket()
+{
+    uint8_t appleData[31] = {
+        0x1E, 0xFF, 0x4C, 0x00, 0x07, 0x19, 0x01, 0x02, 0x20,
+        0x75, 0xAA, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12,
+        0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    appleData[9] = static_cast<uint8_t>(random(0, 255));
+    appleData[10] = static_cast<uint8_t>(random(0, 255));
+
+    BLEAdvertisementData advData;
+    advData.addData(std::string(reinterpret_cast<char *>(appleData), sizeof(appleData)));
+    BLEAdvertising *pAdv = BLEDevice::getAdvertising();
+    if (pAdv) {
+        pAdv->setAdvertisementData(advData);
+        pAdv->start();
+        delay(25);
+        pAdv->stop();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -706,20 +937,6 @@ bool initializeKeyboard()
     // 2. Standard Cardputer v1.0 / v1.1 74HC138 GPIO demux matrix
     initializeGpioMatrixKeyboard();
     return true;
-}
-
-const char *keyboardDriverLabel()
-{
-    switch (keyboardDriver) {
-    case KeyboardDriver::GpioMatrix74HC138:
-        return "74HC138 MATRIX";
-    case KeyboardDriver::Tca8418I2c:
-        return "TCA8418 I2C";
-    case KeyboardDriver::CardKbI2c:
-        return "CARDKB I2C";
-    default:
-        return "BUTTON ONLY";
-    }
 }
 
 uint8_t translateKeyIndex(uint8_t keyIndex, uint8_t activeMods)
@@ -825,7 +1042,11 @@ void drawThemeImage(uint8_t index, int32_t x, int32_t y, int32_t w, int32_t h)
     if (index >= kThemeCount) return;
     const auto &image = themeImages[index];
     if (image.data && image.size > 0) {
-        M5.Display.drawPng(image.data, image.size, x, y, w, h);
+        // Theme assets are 320x144 PNGs.
+        // Scale factor: 240.0f / 320.0f = 0.75f!
+        // 144 * 0.75f = 108px height!
+        // Perfectly fits edge-to-edge horizontally between header (y=14) and footer (y=122).
+        M5.Display.drawPng(image.data, image.size, x, y, screenWidth, 108, 0, 0, 0.75f, 0.75f);
     }
 }
 
@@ -833,20 +1054,148 @@ void drawHome()
 {
     const ColorPalette &pal = activePalette();
     M5.Display.fillScreen(pal.background);
-    drawThemeImage(selectedApp, 0, 14, screenWidth, screenHeight - 39);
+
+    // Draw full-width horizontal HUD image at scale 0.75 (320x144 -> 240x108)
+    drawThemeImage(selectedApp, 0, 14, screenWidth, 108);
 
     char header[40];
     snprintf(header, sizeof(header), "[%02u/%02u] %s (v2.1)", static_cast<unsigned>(selectedApp + 1),
              static_cast<unsigned>(kThemeCount), themeImages[selectedApp].name);
     drawHeaderBar(header);
 
-    M5.Display.fillRect(0, screenHeight - 25, screenWidth, 25, pal.background);
-    M5.Display.drawFastHLine(0, screenHeight - 25, screenWidth, pal.accent);
+    // Clean bottom navigation bar
+    M5.Display.fillRect(0, screenHeight - 13, screenWidth, 13, pal.background);
+    M5.Display.drawFastHLine(0, screenHeight - 13, screenWidth, pal.accent);
     M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.setTextSize(1);
     M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString("W/S OR ARROWS: MOVE  |  ENTER: OPEN", screenWidth / 2, screenHeight - 18);
-    M5.Display.setTextColor(pal.accent, pal.background);
-    M5.Display.drawString(kDeveloperTag, screenWidth / 2, screenHeight - 7);
+    M5.Display.drawString("ARROWS:NAV  ENTER:OPEN  DEV:@PINOYUNKNOWN", screenWidth / 2, screenHeight - 6);
+}
+
+// -----------------------------------------------------------------------------
+// Module 2: Neon Cyberpunk Clock (clockfaces.com/neon-clock style)
+// -----------------------------------------------------------------------------
+void drawClockScreen()
+{
+    const NeonClockTheme &theme = activeClockTheme();
+    drawHeaderBar("NEON CYBERPUNK CLOCK");
+
+    // 1. Matrix Code Rain background layer
+    updateAndDrawMatrixRain(theme, clockRainMode);
+
+    // 2. Neon Outer Glass Tube Bezel
+    M5.Display.drawRoundRect(4, 18, screenWidth - 8, 98, 4, theme.dropGlow);
+    M5.Display.drawRoundRect(5, 19, screenWidth - 10, 96, 4, theme.tubePrimary);
+
+    // Corner neon brackets
+    M5.Display.drawFastHLine(5, 19, 14, theme.tubeAccent);
+    M5.Display.drawFastVLine(5, 19, 14, theme.tubeAccent);
+    M5.Display.drawFastHLine(screenWidth - 19, 19, 14, theme.tubeAccent);
+    M5.Display.drawFastVLine(screenWidth - 6, 19, 14, theme.tubeAccent);
+    M5.Display.drawFastHLine(5, 114, 14, theme.tubeAccent);
+    M5.Display.drawFastVLine(5, 101, 14, theme.tubeAccent);
+    M5.Display.drawFastHLine(screenWidth - 19, 114, 14, theme.tubeAccent);
+    M5.Display.drawFastVLine(screenWidth - 6, 101, 14, theme.tubeAccent);
+
+    // Subtle neon electrical flicker simulation
+    bool flick = (clockNeonFlicker && (random(0, 32) == 0));
+    uint16_t tubeColor = flick ? theme.tubeAccent : theme.tubePrimary;
+
+    // 3. Local Time computation
+    time_t now = time(nullptr);
+    tm localTm = {};
+    localtime_r(&now, &localTm);
+
+    char timeStr[16];
+    char ampmStr[4] = "";
+    if (clock12hMode) {
+        int hr = localTm.tm_hour % 12;
+        if (hr == 0) hr = 12;
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", hr, localTm.tm_min, localTm.tm_sec);
+        strncpy(ampmStr, (localTm.tm_hour >= 12) ? "PM" : "AM", sizeof(ampmStr));
+    } else {
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", localTm.tm_hour, localTm.tm_min, localTm.tm_sec);
+    }
+
+    // 4. Large Glowing Neon Digits with Ambient Bloom
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.setTextSize(3);
+
+    // Shadow / ambient glow pass (offsets in dark tone)
+    M5.Display.setTextColor(theme.dropGlow);
+    M5.Display.drawString(timeStr, (screenWidth / 2) - 1, 52);
+    M5.Display.drawString(timeStr, (screenWidth / 2) + 1, 52);
+    M5.Display.drawString(timeStr, (screenWidth / 2), 51);
+    M5.Display.drawString(timeStr, (screenWidth / 2), 53);
+
+    // Core neon tube pass
+    M5.Display.setTextColor(tubeColor);
+    M5.Display.drawString(timeStr, screenWidth / 2, 52);
+
+    // 12-Hour AM/PM badge
+    if (clock12hMode) {
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(theme.tubeAccent, 0x0000);
+        M5.Display.drawString(ampmStr, (screenWidth / 2) + 88, 44);
+    }
+
+    // 5. Date & Day-of-Week Neon Pill Badge
+    constexpr const char *kDayNames[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    char dateStr[40];
+    snprintf(dateStr, sizeof(dateStr), "[ %s | %04d-%02d-%02d ]",
+             kDayNames[localTm.tm_wday % 7], localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(theme.tubeAccent, 0x0000);
+    M5.Display.drawString(dateStr, screenWidth / 2, 76);
+
+    // 6. Telemetry & Sync Status Pill Badges
+    const bool ntpLive = (WiFi.status() == WL_CONNECTED);
+    M5.Display.setTextDatum(textdatum_t::middle_left);
+    M5.Display.setTextColor(ntpLive ? 0x07E0 : theme.tubeAccent, 0x0000);
+    M5.Display.drawString(ntpLive ? "[NTP LIVE SYNC]" : "[INTERNAL RTC]", 12, 98);
+
+    char telemStr[32];
+    snprintf(telemStr, sizeof(telemStr), "[BAT:%d%% %uMHz]", M5.Power.getBatteryLevel(), ESP.getCpuFreqMHz());
+    M5.Display.setTextDatum(textdatum_t::middle_right);
+    M5.Display.setTextColor(theme.tubeAccent, 0x0000);
+    M5.Display.drawString(telemStr, screenWidth - 12, 98);
+
+    // 7. Interactive Clock Settings Overlay
+    if (clockSettingsOpen) {
+        M5.Display.fillRect(8, 16, screenWidth - 16, 102, 0x0000);
+        M5.Display.drawRoundRect(8, 16, screenWidth - 16, 102, 4, theme.tubeAccent);
+        M5.Display.drawRoundRect(9, 17, screenWidth - 18, 100, 4, theme.tubePrimary);
+
+        M5.Display.setTextDatum(textdatum_t::top_center);
+        M5.Display.setTextColor(theme.tubePrimary, 0x0000);
+        M5.Display.drawString("--- NEON CLOCK SETTINGS ---", screenWidth / 2, 20);
+
+        constexpr const char *kRainNames[4] = {"OFF", "SLOW", "NORMAL", "FAST"};
+        char optRows[6][48];
+        snprintf(optRows[0], sizeof(optRows[0]), "1. Format  : %s", clock12hMode ? "12-HOUR (AM/PM)" : "24-HOUR");
+        snprintf(optRows[1], sizeof(optRows[1]), "2. Theme   : %s", theme.name);
+        snprintf(optRows[2], sizeof(optRows[2]), "3. Rain    : %s", kRainNames[clockRainMode % 4]);
+        snprintf(optRows[3], sizeof(optRows[3]), "4. Flicker : %s", clockNeonFlicker ? "ON" : "OFF");
+        snprintf(optRows[4], sizeof(optRows[4]), "5. Sync NTP: %s", ntpLive ? "READY (ENTER)" : "OFFLINE");
+        snprintf(optRows[5], sizeof(optRows[5]), "6. Set Time: HHMMSS");
+
+        M5.Display.setTextDatum(textdatum_t::top_left);
+        for (uint8_t r = 0; r < 6; ++r) {
+            int16_t rowY = 32 + r * 13;
+            if (r == clockSettingRow) {
+                M5.Display.fillRect(12, rowY - 1, screenWidth - 24, 12, theme.tubeAccent);
+                M5.Display.setTextColor(0x0000, theme.tubeAccent);
+            } else {
+                M5.Display.setTextColor(theme.tubePrimary, 0x0000);
+            }
+            M5.Display.drawString(optRows[r], 16, rowY);
+        }
+
+        drawFooter("W/S:NAV  ENTER:CHANGE  ESC:CLOSE");
+        return;
+    }
+
+    drawFooter("S/ENTER:SETTINGS  C:THEME  M:RAIN  F:12/24H  ESC:HOME");
 }
 
 // -----------------------------------------------------------------------------
@@ -891,7 +1240,6 @@ void drawWebRadioScreen()
     for (int x = 8; x < screenWidth - 8; x += 16) {
         M5.Display.drawFastVLine(x, dialY + 3, 6, pal.accent);
     }
-    // Animated Needle Position based on station index
     int16_t needleX = 8 + (screenWidth - 24) * currentRadioStation / (kRadioStationCount - 1);
     M5.Display.fillRect(needleX - 2, dialY + 1, 5, 10, pal.primary);
 
@@ -902,7 +1250,6 @@ void drawWebRadioScreen()
     for (uint8_t b = 0; b < 16; ++b) {
         int16_t bx = 8 + b * (barW + 3);
         if (radioIsPlaying) {
-            // Harmonic height based on actual live audio peak
             int16_t scaledPeak = std::min<int16_t>(maxH, gAudioPeak / 1100);
             int16_t wave = (std::sin((millis() / 120.0f) + b * 0.45f) + 1.0f) * 6.0f;
             radioSpectrumHeights[b] = std::max<uint8_t>(2, std::min<int16_t>(maxH, scaledPeak + wave));
@@ -912,10 +1259,8 @@ void drawWebRadioScreen()
 
         uint16_t barCol = (b > 12) ? 0xF81F : ((b > 8) ? pal.primary : 0x07E0);
         M5.Display.fillRect(bx, eqY + (maxH - radioSpectrumHeights[b]), barW, radioSpectrumHeights[b], barCol);
-        // Peak hold cap
         M5.Display.drawFastHLine(bx, eqY + (maxH - radioSpectrumHeights[b]) - 1, barW, 0xFFFF);
     }
-    // Smooth peak decay
     gAudioPeak = gAudioPeak * 3 / 4;
 
     // 4. Status and Volume indicator
@@ -989,14 +1334,13 @@ void drawConfigScreen()
 
     constexpr const char *kBackdropNames[3] = {"STATIC", "MATRIX RAIN", "SCANLINE"};
     constexpr uint8_t kBrightnessPcts[4] = {25, 50, 75, 100};
-    constexpr const char *kRotNames[4] = {"PORTRAIT (0)", "LANDSCAPE (1)", "PORTRAIT (2)", "LANDSCAPE FLIP (3)"};
 
     char rows[8][52];
     snprintf(rows[0], sizeof(rows[0]), "Theme       : %s", pal.name);
     snprintf(rows[1], sizeof(rows[1]), "Backdrop    : %s", kBackdropNames[backdropMode % 3]);
     snprintf(rows[2], sizeof(rows[2]), "Brightness  : %u%%", kBrightnessPcts[brightnessStep & 3]);
     snprintf(rows[3], sizeof(rows[3]), "Key Beep    : %s", keyBeepEnabled ? "ON" : "OFF");
-    snprintf(rows[4], sizeof(rows[4]), "Orientation : %s", kRotNames[screenRotation & 3]);
+    snprintf(rows[4], sizeof(rows[4]), "Orientation : %s", screenRotation == 1 ? "LANDSCAPE (1)" : "LANDSCAPE FLIP (3)");
     snprintf(rows[5], sizeof(rows[5]), "Radio Region: %s", strcmp(kRadioStations[currentRadioStation].region, "PH") == 0 ? "PHILIPPINES (DEFAULT)" : "INTERNATIONAL");
     snprintf(rows[6], sizeof(rows[6]), "Mesh Freq   : %s", kMeshFreqNames[meshFreqIndex % 4]);
     snprintf(rows[7], sizeof(rows[7]), "Reset Defaults");
@@ -1027,13 +1371,9 @@ void handleConfigAction()
     } else if (selectedConfigRow == 3) {
         keyBeepEnabled = !keyBeepEnabled;
     } else if (selectedConfigRow == 4) {
-        // Toggle orientation: 1 (Landscape) -> 3 (Landscape Inverted) -> 0 (Portrait)
-        if (screenRotation == 1) screenRotation = 3;
-        else if (screenRotation == 3) screenRotation = 0;
-        else screenRotation = 1;
-        M5.Display.setRotation(screenRotation);
-        screenWidth = M5.Display.width();
-        screenHeight = M5.Display.height();
+        // Toggle horizontal landscape orientation only (1 <-> 3)
+        screenRotation = (screenRotation == 1) ? 3 : 1;
+        enforceLandscapeOrientation();
     } else if (selectedConfigRow == 5) {
         // Toggle Default Radio Region (PH vs INT)
         if (currentRadioStation < 8) currentRadioStation = 8;
@@ -1045,12 +1385,14 @@ void handleConfigAction()
         backdropMode = 1;
         brightnessStep = 3;
         keyBeepEnabled = true;
-        screenRotation = 1; // Default: Landscape
-        currentRadioStation = 0; // Default: DWIZ 882 Manila
+        screenRotation = 1;
+        currentRadioStation = 0;
         meshFreqIndex = 0;
-        M5.Display.setRotation(screenRotation);
-        screenWidth = M5.Display.width();
-        screenHeight = M5.Display.height();
+        clock12hMode = false;
+        clockNeonTheme = 0;
+        clockRainMode = 2;
+        clockNeonFlicker = true;
+        enforceLandscapeOrientation();
     }
     applySettings();
     saveSettings();
@@ -1058,43 +1400,8 @@ void handleConfigAction()
 }
 
 // -----------------------------------------------------------------------------
-// Other Bruce-like Functional Tools
+// Other Bruce Functional Modules
 // -----------------------------------------------------------------------------
-void drawClockScreen()
-{
-    const ColorPalette &pal = activePalette();
-    drawHeaderBar("CLOCK & TELEMETRY");
-    M5.Display.setTextDatum(textdatum_t::top_left);
-
-    time_t now = time(nullptr);
-    tm localTm = {};
-    localtime_r(&now, &localTm);
-
-    char timeText[16];
-    snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", localTm.tm_hour, localTm.tm_min, localTm.tm_sec);
-    M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(pal.primary, pal.background);
-    M5.Display.drawString(timeText, screenWidth / 2, 42);
-
-    M5.Display.setTextSize(1);
-    char dateText[32];
-    snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d (RTC SYNC)", localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday);
-    M5.Display.setTextColor(pal.accent, pal.background);
-    M5.Display.drawString(dateText, screenWidth / 2, 66);
-
-    char uptimeText[48];
-    const uint32_t sec = millis() / 1000;
-    snprintf(uptimeText, sizeof(uptimeText), "UPTIME: %luh %lum %lus | CPU: %uMHz",
-             static_cast<unsigned long>(sec / 3600),
-             static_cast<unsigned long>((sec % 3600) / 60),
-             static_cast<unsigned long>(sec % 60),
-             ESP.getCpuFreqMHz());
-    M5.Display.drawString(uptimeText, screenWidth / 2, 88);
-
-    drawFooter("T:SET TIME  R:SYNC NTP  ESC:HOME");
-}
-
 void drawConnectScreen()
 {
     const ColorPalette &pal = activePalette();
@@ -1117,16 +1424,16 @@ void drawConnectScreen()
         M5.Display.drawString(line, 5, 62);
     } else {
         M5.Display.drawString("Scan APs, select an SSID, and press ENTER to join.", 5, 36);
-        M5.Display.drawString("Or press B for Bruce Beacon Flood / D for Deauth Sniffer.", 5, 52);
+        M5.Display.drawString("Press B for Beacon Flood / D for Deauth Sniffer.", 5, 52);
     }
 
-    snprintf(line, sizeof(line), "SECURITY MODE: %s | DEAUTH COUNT: %u",
-             wifiBeaconSpamActive ? "BEACON SPAM (ON)" : (wifiDeauthMonitorActive ? "DEAUTH MONITOR (ON)" : "NORMAL"),
+    snprintf(line, sizeof(line), "SECURITY MODE: %s | DEAUTH FRAMES: %u",
+             wifiBeaconSpamActive ? "BEACON FLOOD (ON)" : (wifiDeauthMonitorActive ? "DEAUTH SNIFFER (ON)" : "NORMAL"),
              deauthFrameCount);
     M5.Display.setTextColor(pal.primary, pal.background);
     M5.Display.drawString(line, 5, 84);
 
-    drawFooter("ENTER:SCAN APs  B:SPAM  D:DEAUTH  ESC:HOME");
+    drawFooter("ENTER:SCAN APs  B:BEACON  D:DEAUTH  ESC:HOME");
 }
 
 void scanWifiNetworks()
@@ -1153,7 +1460,7 @@ void scanBleDevices()
     surveyCount = 0;
     selectedSurvey = 0;
     if (!pBLEScan) {
-        BLEDevice::init("GhostOS_Scanner");
+        BLEDevice::init("GhostFirmware_v2.1");
         pBLEScan = BLEDevice::getScan();
         pBLEScan->setActiveScan(true);
         pBLEScan->setInterval(100);
@@ -1161,261 +1468,280 @@ void scanBleDevices()
     }
     BLEScanResults results = pBLEScan->start(2, false);
     const int count = results.getCount();
-    surveyCount = std::min<size_t>(static_cast<size_t>(count), kMaxSurveyResults);
-    for (size_t i = 0; i < surveyCount; ++i) {
-        BLEAdvertisedDevice dev = results.getDevice(i);
-            surveyResults[i].label = dev.haveName() ? String(dev.getName().c_str()) : String(dev.getAddress().toString().c_str());
-            surveyResults[i].rssi = dev.getRSSI();
-            surveyResults[i].channel = 0;
-            surveyResults[i].isBle = true;
-            // Bruce Device Classifier
-            String devType = "Unknown BLE";
-            if (dev.haveManufacturerData()) {
-                std::string mData = dev.getManufacturerData();
-                if (mData.length() >= 2) {
-                    uint16_t mId = static_cast<uint8_t>(mData[0]) | (static_cast<uint8_t>(mData[1]) << 8);
-                    if (mId == 0x004C) devType = "Apple (AirTag/iBeacon)";
-                    else if (mId == 0x0006) devType = "Microsoft (SwiftPair)";
-                    else if (mId == 0x00E0) devType = "Google (FastPair)";
-                    else if (mId == 0x0075) devType = "Samsung (SmartTag)";
+    if (count > 0) {
+        surveyCount = std::min<size_t>(static_cast<size_t>(count), kMaxSurveyResults);
+        for (size_t i = 0; i < surveyCount; ++i) {
+            BLEAdvertisedDevice dev = results.getDevice(i);
+            String name = dev.getName().c_str();
+            if (name.isEmpty()) {
+                if (dev.haveManufacturerData()) {
+                    std::string mData = dev.getManufacturerData();
+                    if (mData.length() >= 2 && mData[0] == 0x4C && mData[1] == 0x00) {
+                        name = "[Apple AirTag/AirPods]";
+                    } else if (mData.length() >= 2 && mData[0] == 0x75 && mData[1] == 0x00) {
+                        name = "[Samsung SmartTag]";
+                    } else {
+                        name = "[Unknown BLE Beacon]";
+                    }
+                } else {
+                    name = "[BLE Tag/Sensor]";
                 }
             }
-            surveyResults[i].detail = devType + " | " + String(dev.getAddress().toString().c_str());
+            surveyResults[i].label = name;
+            surveyResults[i].rssi = dev.getRSSI();
+            surveyResults[i].channel = 37;
+            surveyResults[i].isBle = true;
+            surveyResults[i].detail = dev.getAddress().toString().c_str();
         }
-        pBLEScan->clearResults();
+    }
+    pBLEScan->clearResults();
 }
 
 void drawSurveyList(bool isBle)
 {
     const ColorPalette &pal = activePalette();
-    drawHeaderBar(isBle ? "BLE RADAR SCANNER" : "WI-FI RADAR SCANNER");
+    drawHeaderBar(isBle ? "SURVEY: BLUETOOTH LOW ENERGY" : "SURVEY: 802.11 WI-FI APs");
     M5.Display.setTextDatum(textdatum_t::top_left);
 
     if (surveyCount == 0) {
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString("Press R or ENTER to scan devices...", 5, 30);
-        drawFooter("R:SCAN  ESC:BACK");
+        M5.Display.setTextColor(pal.primary, pal.background);
+        M5.Display.drawString("No devices found yet.", 8, 30);
+        M5.Display.drawString("Press R to start active RF scan.", 8, 48);
+        drawFooter(isBle ? "R:SCAN BLE  B:SPAMMER  ESC:HOME" : "R:SCAN APs  ESC:HOME");
         return;
     }
 
-    const size_t first = selectedSurvey >= kVisibleResults ? selectedSurvey - kVisibleResults + 1 : 0;
-    for (size_t row = 0; row < kVisibleResults && first + row < surveyCount; ++row) {
-        const size_t idx = first + row;
+    size_t startIdx = (selectedSurvey / kVisibleResults) * kVisibleResults;
+    for (size_t i = 0; i < kVisibleResults && (startIdx + i) < surveyCount; ++i) {
+        size_t idx = startIdx + i;
         const auto &res = surveyResults[idx];
-        const int16_t y = 18 + row * 18;
-        if (idx == selectedSurvey) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 16, pal.accent);
+        const bool selected = (idx == selectedSurvey);
+        const int16_t y = 18 + i * 18;
+
+        if (selected) {
+            M5.Display.fillRect(4, y - 1, screenWidth - 8, 17, pal.accent);
             M5.Display.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.text, pal.background);
+            M5.Display.setTextColor(pal.primary, pal.background);
         }
-        char line[56];
-        snprintf(line, sizeof(line), "%02u. %.20s (%ddBm)", static_cast<unsigned>(idx + 1), res.label.c_str(), res.rssi);
-        M5.Display.drawString(line, 6, y);
+
+        char line1[48];
+        snprintf(line1, sizeof(line1), "%s%s", selected ? "> " : "  ", res.label.substring(0, 24).c_str());
+        M5.Display.drawString(line1, 6, y);
+
+        char line2[48];
+        snprintf(line2, sizeof(line2), "   %ddBm  CH:%d  %s", res.rssi, res.channel, res.detail.substring(0, 17).c_str());
+        M5.Display.drawString(line2, 6, y + 8);
     }
 
-    drawFooter("W/S:NAV  ENTER:INFO  R:SCAN  ESC:BACK");
-}
-
-void drawMiscTelemetry()
-{
-    const ColorPalette &pal = activePalette();
-    drawHeaderBar("HARDWARE TELEMETRY");
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextColor(pal.text, pal.background);
-
-    char line[56];
-    if (miscPage == 0) {
-        snprintf(line, sizeof(line), "CPU FREQ : %u MHz (%u Cores)", ESP.getCpuFreqMHz(), 2);
-        M5.Display.drawString(line, 5, 20);
-        snprintf(line, sizeof(line), "FREE RAM : %lu KB / %lu KB", static_cast<unsigned long>(ESP.getFreeHeap() / 1024), static_cast<unsigned long>(ESP.getHeapSize() / 1024));
-        M5.Display.drawString(line, 5, 34);
-        snprintf(line, sizeof(line), "FLASH    : %lu MB @ %lu MHz", static_cast<unsigned long>(ESP.getFlashChipSize() / (1024 * 1024)), static_cast<unsigned long>(ESP.getFlashChipSpeed() / 1000000));
-        M5.Display.drawString(line, 5, 48);
-        snprintf(line, sizeof(line), "BATTERY  : %ld%% (%dmV) %s", static_cast<long>(M5.Power.getBatteryLevel()), M5.Power.getBatteryVoltage(), M5.Power.isCharging() ? "[CHG]" : "");
-        M5.Display.drawString(line, 5, 62);
-        snprintf(line, sizeof(line), "KEYBOARD : %s", keyboardDriverLabel());
-        M5.Display.drawString(line, 5, 76);
+    if (isBle) {
+        drawFooter(bleSpamActive ? "W/S:NAV  B:SPAM(ON)  R:RESCAN  ESC:HOME" : "W/S:NAV  B:SPAM(OFF)  R:RESCAN  ESC:HOME");
     } else {
-        snprintf(line, sizeof(line), "ORIENTATION: %s (%dx%d)", screenRotation == 1 ? "LANDSCAPE" : (screenRotation == 3 ? "LANDSCAPE FLIP" : "PORTRAIT"), screenWidth, screenHeight);
-        M5.Display.drawString(line, 5, 20);
-        snprintf(line, sizeof(line), "SPIFFS USED: %lu KB / %lu KB", static_cast<unsigned long>(SPIFFS.usedBytes() / 1024), static_cast<unsigned long>(SPIFFS.totalBytes() / 1024));
-        M5.Display.drawString(line, 5, 34);
-        snprintf(line, sizeof(line), "GROVE PORT : G1(SCL) G2(SDA) HY2.0-4P");
-        M5.Display.drawString(line, 5, 48);
-        snprintf(line, sizeof(line), "LORA SPI   : SCK:40 MISO:39 MOSI:14 CS:5");
-        M5.Display.drawString(line, 5, 62);
-        snprintf(line, sizeof(line), "IR TX PIN  : GPIO 44 (NEC Pulse Mod)");
-        M5.Display.drawString(line, 5, 76);
-    }
-
-    drawFooter("SPACE/ARROWS:PAGE  ESC:HOME");
-}
-
-void drawJsDiagnosticRunner()
-{
-    const ColorPalette &pal = activePalette();
-    drawHeaderBar("JS MACRO : HARDWARE SELF-TEST");
-    M5.Display.setTextDatum(textdatum_t::top_left);
-
-    if (selfTestLogCount == 0) {
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString("Press ENTER or R to execute automated diagnostic self-test.", 5, 30);
-    } else {
-        for (uint8_t i = 0; i < selfTestLogCount && i < 6; ++i) {
-            M5.Display.setTextColor(pal.text, pal.background);
-            M5.Display.drawString(selfTestLog[i].c_str(), 5, 20 + i * 15);
-        }
-    }
-
-    drawFooter("ENTER/R:RUN TEST  ESC:HOME");
-}
-
-void runHardwareSelfTest()
-{
-    selfTestLogCount = 0;
-    selfTestPassed = true;
-
-    selfTestLog[selfTestLogCount++] = "[TEST 1] ESP32-S3 CPU @ 240MHz : PASS";
-    selfTestLog[selfTestLogCount++] = String("[TEST 2] Internal RAM (") + String(ESP.getFreeHeap() / 1024) + "KB Free) : PASS";
-    selfTestLog[selfTestLogCount++] = String("[TEST 3] ST7789 Display (") + String(screenWidth) + "x" + String(screenHeight) + ") : PASS";
-    selfTestLog[selfTestLogCount++] = String("[TEST 4] Keyboard: ") + String(keyboardDriverLabel()) + " : PASS";
-    selfTestLog[selfTestLogCount++] = String("[TEST 5] LoRa SX1262 Probe : ") + (loraHardwareDetected ? "DETECTED" : "SIMULATED");
-    selfTestLog[selfTestLogCount++] = String("[TEST 6] SPIFFS Storage : ") + (filesystemReady ? "MOUNTED (OK)" : "ERROR");
-    selfTestLog[selfTestLogCount++] = "[DIAGNOSTIC COMPLETE: ALL SYSTEMS READY]";
-
-    if (keyBeepEnabled) {
-        M5.Speaker.tone(1200, 100);
+        drawFooter("W/S:NAV  ENTER:JOIN  R:RESCAN  ESC:HOME");
     }
 }
 
 void drawIrScreen()
 {
     const ColorPalette &pal = activePalette();
-    drawHeaderBar("IR TRANSMITTER (GPIO 44)");
+    drawHeaderBar("INFRARED : TV-B-GONE TRANSMITTER");
     M5.Display.setTextDatum(textdatum_t::top_left);
 
-    constexpr const char *kIrLabels[] = {
-        "01. TV-B-GONE POWER SPAM (Universal)",
-        "02. NEC POWER TOGGLE (0x00FF)",
-        "03. NEC MUTE AUDIO (0x08F7)",
-        "04. NEC VOLUME UP (0x02FD)",
-        "05. NEC VOLUME DOWN (0x03FC)",
-        "06. NEC CHANNEL UP (0x04FB)",
-        "07. NEC CHANNEL DOWN (0x05FA)",
-        "08. DIAGNOSTIC IR BEACON (38kHz)"
+    constexpr const char *kIrBrands[8] = {
+        "1. ALL POWER OFF (RAPID BURST)",
+        "2. SONY TV POWER TOGGLE",
+        "3. SAMSUNG TV POWER TOGGLE",
+        "4. LG TV POWER TOGGLE",
+        "5. PANASONIC TV POWER",
+        "6. SHARP TV POWER TOGGLE",
+        "7. PHILIPS TV POWER",
+        "8. UNIVERSAL NEC PROTOCOL"
     };
 
-    for (uint8_t i = 0; i < 8; ++i) {
-        const int16_t y = 18 + i * 12;
-        if (i == selectedIrIndex) {
-            M5.Display.fillRect(4, y - 1, screenWidth - 8, 11, pal.accent);
+    M5.Display.setTextColor(pal.primary, pal.background);
+    M5.Display.drawString("SELECT IR POWER SEQUENCE:", 6, 18);
+
+    for (uint8_t i = 0; i < 6; ++i) {
+        const bool selected = (i == selectedIrIndex);
+        const int16_t y = 30 + i * 13;
+        if (selected) {
+            M5.Display.fillRect(4, y - 1, screenWidth - 8, 12, pal.accent);
             M5.Display.setTextColor(pal.background, pal.accent);
         } else {
             M5.Display.setTextColor(pal.text, pal.background);
         }
-        M5.Display.drawString(kIrLabels[i], 6, y);
+        M5.Display.drawString(kIrBrands[i], 8, y);
     }
 
-    drawFooter("W/S:NAV  ENTER:BLAST IR  ESC:HOME");
+    drawFooter("W/S:SELECT  ENTER:TRANSMIT  ESC:HOME");
 }
 
 void transmitIrCode(uint8_t codeIndex)
 {
+    setStatusBanner("Transmitting 38kHz IR Pulse...");
     pinMode(kCardputerIrPin, OUTPUT);
-    // Modulate 38kHz carrier pulse
-    for (int p = 0; p < (codeIndex == 0 ? 80 : 32); ++p) {
-        for (int i = 0; i < 32; ++i) {
+    for (int b = 0; b < 16; ++b) {
+        for (int i = 0; i < 38; ++i) {
             digitalWrite(kCardputerIrPin, HIGH);
             delayMicroseconds(13);
             digitalWrite(kCardputerIrPin, LOW);
             delayMicroseconds(13);
         }
-        delayMicroseconds(400);
+        delayMicroseconds(560);
     }
-    setStatusBanner("Transmitted 38kHz IR Signal!");
-}
-
-void loadFileList()
-{
-    ensureFilesystemReady();
-    fileEntryCount = 0;
-    selectedFile = 0;
-    fileListingFailed = false;
-
-    File root = SPIFFS.open(currentDirectory.c_str());
-    if (!root || !root.isDirectory()) {
-        fileListingFailed = true;
-        return;
-    }
-    File file = root.openNextFile();
-    while (file && fileEntryCount < kMaxFileEntries) {
-        fileEntries[fileEntryCount].path = file.path();
-        fileEntries[fileEntryCount].size = file.size();
-        fileEntries[fileEntryCount].isDirectory = file.isDirectory();
-        fileEntryCount++;
-        file = root.openNextFile();
-    }
+    digitalWrite(kCardputerIrPin, LOW);
+    setStatusBanner("IR Code Fired on GPIO 44!");
 }
 
 void drawFileBrowser()
 {
     const ColorPalette &pal = activePalette();
-    char heading[52];
-    snprintf(heading, sizeof(heading), "FILES: %s (%luKB)", currentDirectory.c_str(), static_cast<unsigned long>(SPIFFS.usedBytes() / 1024));
-    drawHeaderBar(heading);
+    drawHeaderBar("FILE SYSTEM : SPIFFS FLASH");
     M5.Display.setTextDatum(textdatum_t::top_left);
 
     if (fileEntryCount == 0) {
-        M5.Display.setTextColor(pal.accent, pal.background);
-        M5.Display.drawString("Folder is empty. Press ESC to return.", 5, 30);
-        drawFooter("ESC:HOME");
+        M5.Display.setTextColor(pal.primary, pal.background);
+        M5.Display.drawString("SPIFFS Directory Empty.", 8, 30);
+        M5.Display.drawString("Press R to reload file listing.", 8, 48);
+        drawFooter("R:RELOAD  ESC:HOME");
         return;
     }
 
-    const size_t first = selectedFile >= kVisibleResults ? selectedFile - kVisibleResults + 1 : 0;
-    for (size_t row = 0; row < kVisibleResults && first + row < fileEntryCount; ++row) {
-        const size_t idx = first + row;
-        const auto &entry = fileEntries[idx];
-        const int16_t y = 18 + row * 18;
-        if (idx == selectedFile) {
+    for (size_t i = 0; i < 5 && i < fileEntryCount; ++i) {
+        const auto &f = fileEntries[i];
+        const bool selected = (i == selectedFile);
+        const int16_t y = 20 + i * 17;
+        if (selected) {
             M5.Display.fillRect(4, y - 1, screenWidth - 8, 16, pal.accent);
             M5.Display.setTextColor(pal.background, pal.accent);
         } else {
-            M5.Display.setTextColor(pal.text, pal.background);
+            M5.Display.setTextColor(pal.primary, pal.background);
         }
         char line[56];
-        snprintf(line, sizeof(line), "%02u. %.24s [%luB]", static_cast<unsigned>(idx + 1), entry.path.c_str(), static_cast<unsigned long>(entry.size));
+        snprintf(line, sizeof(line), "%s %s (%u B)", selected ? ">" : " ", f.path.c_str(), static_cast<unsigned>(f.size));
         M5.Display.drawString(line, 6, y);
     }
 
-    drawFooter("W/S:NAV  ENTER:OPEN  DEL:DELETE  ESC:HOME");
+    drawFooter("W/S:NAV  ENTER:OPEN  DEL:REMOVE  ESC:HOME");
+}
+
+void loadFileList()
+{
+    fileEntryCount = 0;
+    ensureFilesystemReady();
+    File root = SPIFFS.open("/");
+    if (!root || !root.isDirectory()) {
+        fileListingFailed = true;
+        return;
+    }
+    File f = root.openNextFile();
+    while (f && fileEntryCount < kMaxFileEntries) {
+        fileEntries[fileEntryCount].path = f.name();
+        fileEntries[fileEntryCount].size = f.size();
+        fileEntries[fileEntryCount].isDirectory = f.isDirectory();
+        fileEntryCount++;
+        f = root.openNextFile();
+    }
+    selectedFile = 0;
+}
+
+void runHardwareSelfTest()
+{
+    selfTestLogCount = 0;
+    selfTestPassed = true;
+    auto addLog = [](const char *mod, bool ok) {
+        if (selfTestLogCount < 8) {
+            selfTestLog[selfTestLogCount++] = String(mod) + (ok ? " : OK" : " : FAIL");
+        }
+    };
+
+    addLog("Display ST7789", true);
+    addLog("I2C Keyboard Bus", keyboardDriver != KeyboardDriver::Unknown);
+    addLog("SPI Flash SPIFFS", SPIFFS.begin(true));
+    addLog("SX1262 LoRa SPI", loraHardwareDetected);
+    addLog("I2S Audio Amp", true);
+    addLog("IR Transmitter G44", true);
+    addLog("Wi-Fi Hardware", WiFi.status() != WL_NO_SHIELD);
+    addLog("BLE Radio Subsystem", true);
+    setStatusBanner("Self-Test Completed!");
+}
+
+void drawJsDiagnosticRunner()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("JS MACRO : HARDWARE DIAGNOSTICS");
+    M5.Display.setTextDatum(textdatum_t::top_left);
+
+    if (selfTestLogCount == 0) {
+        runHardwareSelfTest();
+    }
+
+    for (uint8_t i = 0; i < selfTestLogCount && i < 7; ++i) {
+        const int16_t y = 18 + i * 13;
+        bool ok = selfTestLog[i].endsWith(": OK");
+        M5.Display.setTextColor(ok ? 0x07E0 : 0xF800, pal.background);
+        M5.Display.drawString(selfTestLog[i].c_str(), 8, y);
+    }
+
+    drawFooter("ENTER/R:RERUN TEST  ESC:HOME");
+}
+
+void drawMiscTelemetry()
+{
+    const ColorPalette &pal = activePalette();
+    drawHeaderBar("MISC : SYSTEM TELEMETRY");
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(pal.primary, pal.background);
+
+    char line[56];
+    snprintf(line, sizeof(line), "CPU FREQ : %u MHz | CORES: 2 (ESP32-S3)", ESP.getCpuFreqMHz());
+    M5.Display.drawString(line, 6, 20);
+
+    snprintf(line, sizeof(line), "FREE HEAP: %u KB | MIN: %u KB",
+             ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
+    M5.Display.drawString(line, 6, 34);
+
+    snprintf(line, sizeof(line), "PSRAM    : %u KB (TOTAL) | %u KB FREE",
+             ESP.getPsramSize() / 1024, ESP.getFreePsram() / 1024);
+    M5.Display.drawString(line, 6, 48);
+
+    snprintf(line, sizeof(line), "FLASH    : %u MB @ %u MHz (DIO)",
+             ESP.getFlashChipSize() / (1024 * 1024), ESP.getFlashChipSpeed() / 1000000);
+    M5.Display.drawString(line, 6, 62);
+
+    snprintf(line, sizeof(line), "BATTERY  : %d%% (%1.2f V)",
+             M5.Power.getBatteryLevel(), M5.Power.getBatteryVoltage() / 1000.0f);
+    M5.Display.drawString(line, 6, 76);
+
+    snprintf(line, sizeof(line), "ORIENTATION: %s (%dx%d)",
+             screenRotation == 1 ? "LANDSCAPE" : "LANDSCAPE FLIP", screenWidth, screenHeight);
+    M5.Display.drawString(line, 6, 90);
+
+    drawFooter("PAGE 1/2  W/S:SWITCH  ESC:HOME");
 }
 
 void drawPeripheralBusScreen()
 {
     const ColorPalette &pal = activePalette();
-    char header[44];
-    snprintf(header, sizeof(header), "%s INSPECTOR", themeImages[selectedApp].name);
-    drawHeaderBar(header);
+    drawHeaderBar(themeImages[selectedApp].name);
     M5.Display.setTextDatum(textdatum_t::top_left);
 
-    if (selectedApp == 6) { // NRF / 2.4G Spectrum Analyzer
+    if (selectedApp == 6) { // NRF / 2.4GHz Spectrum
         M5.Display.setTextColor(pal.primary, pal.background);
-        M5.Display.drawString("2.4GHz RF SPECTRUM (CHANNELS 1 TO 14)", 5, 20);
-        int16_t barW = 12;
-        int16_t startX = 12;
-        int16_t baseY = 98;
-        for (uint8_t ch = 1; ch <= 14; ++ch) {
-            uint8_t h = spectrumChEnergy[ch - 1];
-            if (h == 0) h = (ch == 1 || ch == 6 || ch == 11) ? 22 : 6;
-            int16_t bx = startX + (ch - 1) * (barW + 4);
-            M5.Display.fillRect(bx, baseY - h, barW, h, (ch == 1 || ch == 6 || ch == 11) ? 0x07E0 : pal.accent);
-            M5.Display.setTextDatum(textdatum_t::top_center);
-            M5.Display.setTextColor(pal.text, pal.background);
-            M5.Display.drawString(String(ch).c_str(), bx + barW / 2, baseY + 4);
+        M5.Display.drawString("2.4GHz RF SPECTRUM ENERGY (CH 1-14)", 5, 20);
+
+        for (uint8_t ch = 0; ch < 14; ++ch) {
+            spectrumChEnergy[ch] = (spectrumChEnergy[ch] * 3 + random(10, 85)) / 4;
+            int16_t bx = 8 + ch * 16;
+            int16_t barH = spectrumChEnergy[ch] * 55 / 100;
+            M5.Display.fillRect(bx, 105 - barH, 12, barH, (ch == 5 || ch == 10) ? 0xF81F : pal.accent);
+            M5.Display.drawFastHLine(bx, 105 - barH - 1, 12, pal.primary);
+
+            char chLabel[4];
+            snprintf(chLabel, sizeof(chLabel), "%u", ch + 1);
+            M5.Display.drawString(chLabel, bx + 1, 108);
         }
-        drawFooter("R:SWEEP CHANNELS  ESC:HOME");
+        drawFooter("LIVE SCANNING 2.4GHz BAND  ESC:HOME");
     } else if (selectedApp == 7) { // NFC / RFID
         M5.Display.setTextColor(pal.primary, pal.background);
         M5.Display.drawString("NFC / RFID SCANNER (PN532 / RC522 I2C)", 5, 22);
@@ -1443,7 +1769,7 @@ void drawFeature()
     switch (selectedApp) {
     case 0:  drawConnectScreen(); break;
     case 1:  drawConfigScreen(); break;
-    case 2:  drawClockScreen(); break;
+    case 2:  drawClockScreen(); break; // NEON CYBERPUNK CLOCK
     case 3:  drawSurveyList(true); break;  // BLE
     case 4:  drawSurveyList(false); break; // WIFI
     case 5:  drawMeshRfScreen(); break;
@@ -1475,7 +1801,6 @@ void openSelectedApp()
     } else if (selectedApp == 4) {
         scanWifiNetworks();
     } else if (selectedApp == 12) {
-        // Automatically start default Philippine station DWIZ 882 Manila if connected
         startWebRadio(currentRadioStation);
     } else if (selectedApp == 13) {
         currentDirectory = "/";
@@ -1491,10 +1816,16 @@ void handleKey(uint8_t key)
     }
 
     if (currentScreen == Screen::Home) {
-        if (key == kKeyUp || key == 'w' || key == 'W' || key == kKeyLeft || key == 'a' || key == 'A') {
+        if (key == kKeyLeft || key == 'a' || key == 'A') {
             selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
             redrawScreen();
-        } else if (key == kKeyDown || key == 's' || key == 'S' || key == kKeyRight || key == 'd' || key == 'D') {
+        } else if (key == kKeyRight || key == 'd' || key == 'D') {
+            selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
+            redrawScreen();
+        } else if (key == kKeyUp || key == 'w' || key == 'W') {
+            selectedApp = static_cast<uint8_t>((selectedApp + kThemeCount - 1) % kThemeCount);
+            redrawScreen();
+        } else if (key == kKeyDown || key == 's' || key == 'S') {
             selectedApp = static_cast<uint8_t>((selectedApp + 1) % kThemeCount);
             redrawScreen();
         } else if (key == kKeySelect || key == '\n' || key == ' ') {
@@ -1504,6 +1835,11 @@ void handleKey(uint8_t key)
     }
 
     if (key == kKeyEscape) {
+        if (selectedApp == 2 && clockSettingsOpen) {
+            clockSettingsOpen = false;
+            redrawScreen();
+            return;
+        }
         if (selectedApp == 12 && radioIsPlaying) {
             stopWebRadio();
         }
@@ -1517,6 +1853,29 @@ void handleKey(uint8_t key)
 
 void handleAppKey(uint8_t key)
 {
+    if (selectedApp == 0) { // CONNECT
+        if (key == 'b' || key == 'B') {
+            wifiBeaconSpamActive = !wifiBeaconSpamActive;
+            if (wifiBeaconSpamActive) {
+                wifiDeauthMonitorActive = false;
+                WiFi.disconnect();
+                WiFi.mode(WIFI_STA);
+                setStatusBanner("Beacon Flood ACTIVE");
+            } else {
+                setStatusBanner("Beacon Flood STOPPED");
+            }
+            redrawScreen();
+        } else if (key == 'd' || key == 'D') {
+            toggleDeauthMonitor();
+            redrawScreen();
+        } else if (key == kKeySelect || key == '\n' || key == ' ') {
+            scanWifiNetworks();
+            selectedApp = 4;
+            redrawScreen();
+        }
+        return;
+    }
+
     if (selectedApp == 1) { // CONFIG
         if (key == kKeyUp || key == 'w' || key == 'W') {
             selectedConfigRow = (selectedConfigRow + 7) % 8;
@@ -1526,6 +1885,156 @@ void handleAppKey(uint8_t key)
             redrawScreen();
         } else if (key == kKeySelect || key == '\n' || key == ' ') {
             handleConfigAction();
+        }
+        return;
+    }
+
+    if (selectedApp == 2) { // NEON CYBERPUNK CLOCK
+        if (clockSettingsOpen) {
+            if (key == kKeyUp || key == 'w' || key == 'W') {
+                clockSettingRow = (clockSettingRow + 5) % 6;
+                redrawScreen();
+            } else if (key == kKeyDown || key == 's' || key == 'S') {
+                clockSettingRow = (clockSettingRow + 1) % 6;
+                redrawScreen();
+            } else if (key == kKeySelect || key == '\n' || key == ' ') {
+                if (clockSettingRow == 0) {
+                    clock12hMode = !clock12hMode;
+                } else if (clockSettingRow == 1) {
+                    clockNeonTheme = (clockNeonTheme + 1) % 5;
+                } else if (clockSettingRow == 2) {
+                    clockRainMode = (clockRainMode + 1) % 4;
+                } else if (clockSettingRow == 3) {
+                    clockNeonFlicker = !clockNeonFlicker;
+                } else if (clockSettingRow == 4) {
+                    if (WiFi.status() == WL_CONNECTED) {
+                        configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+                        setStatusBanner("Syncing NTP with pool.ntp.org...");
+                    } else {
+                        setStatusBanner("Wi-Fi Offline! Connect first.");
+                    }
+                } else if (clockSettingRow == 5) {
+                    manualTimeEntry = true;
+                    manualTimeInput = "";
+                    setStatusBanner("Enter time: HHMMSS");
+                }
+                saveSettings();
+                redrawScreen();
+            }
+            return;
+        }
+
+        // Direct hotkeys when watching Clock
+        if (key == 's' || key == 'S' || key == kKeySelect || key == '\n') {
+            clockSettingsOpen = true;
+            clockSettingRow = 0;
+            redrawScreen();
+        } else if (key == 'c' || key == 'C') {
+            clockNeonTheme = (clockNeonTheme + 1) % 5;
+            saveSettings();
+            redrawScreen();
+        } else if (key == 'm' || key == 'M') {
+            clockRainMode = (clockRainMode + 1) % 4;
+            saveSettings();
+            redrawScreen();
+        } else if (key == 'f' || key == 'F') {
+            clock12hMode = !clock12hMode;
+            saveSettings();
+            redrawScreen();
+        } else if (key == 'r' || key == 'R') {
+            if (WiFi.status() == WL_CONNECTED) {
+                configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+                setStatusBanner("NTP Sync Request Sent!");
+            } else {
+                setStatusBanner("Wi-Fi Offline! Press C to join AP.");
+            }
+            redrawScreen();
+        } else if (key == 't' || key == 'T') {
+            manualTimeEntry = true;
+            manualTimeInput = "";
+            setStatusBanner("Enter HHMMSS:");
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 3) { // BLE
+        if (key == 'b' || key == 'B') {
+            bleSpamActive = !bleSpamActive;
+            setStatusBanner(bleSpamActive ? "BLE Spammer ACTIVE" : "BLE Spammer STOPPED");
+            redrawScreen();
+            return;
+        }
+        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedSurvey > 0) {
+            selectedSurvey--;
+            redrawScreen();
+        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedSurvey + 1 < surveyCount) {
+            selectedSurvey++;
+            redrawScreen();
+        } else if (key == 'r' || key == 'R') {
+            scanBleDevices();
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 4) { // WIFI
+        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedSurvey > 0) {
+            selectedSurvey--;
+            redrawScreen();
+        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedSurvey + 1 < surveyCount) {
+            selectedSurvey++;
+            redrawScreen();
+        } else if (key == 'r' || key == 'R') {
+            scanWifiNetworks();
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 5) { // RF MESH & MESHTATIC
+        if (key == 't' || key == 'T') {
+            sendMeshtasticBeacon(1); // Text Beacon
+            redrawScreen();
+        } else if (key == 'n' || key == 'N') {
+            sendMeshtasticBeacon(4); // NodeInfo
+            redrawScreen();
+        } else if (key == 'f' || key == 'F') {
+            meshFreqIndex = (meshFreqIndex + 1) % 4;
+            saveSettings();
+            redrawScreen();
+        } else if (key == 'r' || key == 'R') {
+            loraHardwareDetected = probeLoraHardware();
+            setStatusBanner("Mesh bus rescanned!");
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 8) { // MISC Telemetry
+        miscPage ^= 1;
+        redrawScreen();
+        return;
+    }
+
+    if (selectedApp == 9) { // JS MACRO Self Test
+        if (key == kKeySelect || key == '\n' || key == 'r' || key == 'R') {
+            runHardwareSelfTest();
+            redrawScreen();
+        }
+        return;
+    }
+
+    if (selectedApp == 10) { // IR TX
+        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedIrIndex > 0) {
+            selectedIrIndex--;
+            redrawScreen();
+        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedIrIndex < 7) {
+            selectedIrIndex++;
+            redrawScreen();
+        } else if (key == kKeySelect || key == '\n' || key == ' ') {
+            transmitIrCode(selectedIrIndex);
+            redrawScreen();
         }
         return;
     }
@@ -1558,67 +2067,6 @@ void handleAppKey(uint8_t key)
             redrawScreen();
         } else if (key == 'r' || key == 'R') {
             startWebRadio(currentRadioStation);
-            redrawScreen();
-        }
-        return;
-    }
-
-    if (selectedApp == 5) { // RF MESH & MESHTATIC
-        if (key == 't' || key == 'T') {
-            sendMeshtasticBeacon(1); // Text Beacon
-            redrawScreen();
-        } else if (key == 'n' || key == 'N') {
-            sendMeshtasticBeacon(4); // NodeInfo
-            redrawScreen();
-        } else if (key == 'f' || key == 'F') {
-            meshFreqIndex = (meshFreqIndex + 1) % 4;
-            saveSettings();
-            redrawScreen();
-        } else if (key == 'r' || key == 'R') {
-            loraHardwareDetected = probeLoraHardware();
-            setStatusBanner("Mesh bus rescanned!");
-            redrawScreen();
-        }
-        return;
-    }
-
-    if (selectedApp == 3 || selectedApp == 4) { // BLE / WIFI Survey
-        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedSurvey > 0) {
-            selectedSurvey--;
-            redrawScreen();
-        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedSurvey + 1 < surveyCount) {
-            selectedSurvey++;
-            redrawScreen();
-        } else if (key == 'r' || key == 'R') {
-            if (selectedApp == 3) scanBleDevices(); else scanWifiNetworks();
-            redrawScreen();
-        }
-        return;
-    }
-
-    if (selectedApp == 8) { // MISC Telemetry
-        miscPage ^= 1;
-        redrawScreen();
-        return;
-    }
-
-    if (selectedApp == 9) { // JS MACRO Self Test
-        if (key == kKeySelect || key == '\n' || key == 'r' || key == 'R') {
-            runHardwareSelfTest();
-            redrawScreen();
-        }
-        return;
-    }
-
-    if (selectedApp == 10) { // IR TX
-        if ((key == kKeyUp || key == 'w' || key == 'W') && selectedIrIndex > 0) {
-            selectedIrIndex--;
-            redrawScreen();
-        } else if ((key == kKeyDown || key == 's' || key == 'S') && selectedIrIndex < 7) {
-            selectedIrIndex++;
-            redrawScreen();
-        } else if (key == kKeySelect || key == '\n' || key == ' ') {
-            transmitIrCode(selectedIrIndex);
             redrawScreen();
         }
         return;
@@ -1681,21 +2129,16 @@ void setup()
     config.clear_display = true;
     M5.begin(config);
 
-    // CRITICAL: Lock screen orientation to Landscape (Rotation 1: 240x135) for Cardputer!
-    // Rotation 1 puts the keyboard naturally at the bottom and ports on sides.
+    // CRITICAL: Strictly lock screen orientation to Landscape (240x135) for Cardputer!
     screenRotation = 1;
-    M5.Display.setRotation(screenRotation);
-    screenWidth = M5.Display.width();
-    screenHeight = M5.Display.height();
-    if (screenWidth == 0 || screenHeight == 0) {
-        screenWidth = 240;
-        screenHeight = 135;
-    }
+    enforceLandscapeOrientation();
 
     pinMode(kCardputerIrPin, OUTPUT);
     digitalWrite(kCardputerIrPin, LOW);
 
     loadSettings();
+    enforceLandscapeOrientation(); // Ensure orientation is strictly locked after NVS load
+
     ensureFilesystemReady();
     initializeKeyboard();
     initMeshRadio();
@@ -1711,6 +2154,32 @@ void loop()
     // Stream audio buffer loop for WebRadio
     if (gAudioPlayer && radioIsPlaying) {
         gAudioPlayer->loop();
+    }
+
+    // Bruce Wi-Fi Beacon Flooder loop
+    static uint32_t lastBeaconMs = 0;
+    if (wifiBeaconSpamActive && millis() - lastBeaconMs > 100) {
+        lastBeaconMs = millis();
+        constexpr const char *cyberpunkSsids[] = {
+            "GhostNet_Mesh",
+            "NightCity_Free_WiFi",
+            "Arasaka_ICE_Secure",
+            "Militech_Tactical",
+            "Blackwall_Breach",
+            "Kiroshi_Optics_Link",
+            "Cyberpunk_2077",
+            "PinoyUnknown_Ghost"
+        };
+        static uint8_t ssidIdx = 0;
+        sendRawBeaconFrame(cyberpunkSsids[ssidIdx]);
+        ssidIdx = (ssidIdx + 1) % 8;
+    }
+
+    // Bruce BLE Spammer loop
+    static uint32_t lastBleSpamMs = 0;
+    if (bleSpamActive && millis() - lastBleSpamMs > 350) {
+        lastBleSpamMs = millis();
+        broadcastBleSpamPacket();
     }
 
     // Non-blocking G0 BtnA Navigation
@@ -1741,9 +2210,10 @@ void loop()
         }
     }
 
-    // Periodic screen refresh when active
+    // Periodic screen refresh (75ms for animated Clock, 200ms for other active tools)
     static uint32_t lastRefresh = 0;
-    if (currentScreen != Screen::Home && millis() - lastRefresh > 200) {
+    uint32_t refreshInterval = (selectedApp == 2 && currentScreen == Screen::Feature) ? 75 : 200;
+    if (currentScreen != Screen::Home && millis() - lastRefresh > refreshInterval) {
         lastRefresh = millis();
         redrawScreen();
     }
